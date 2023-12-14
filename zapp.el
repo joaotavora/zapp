@@ -293,7 +293,7 @@ CONNECT-ARGS are passed as additional arguments to
                                   (file-name-base (car contact))))
            (setq name (format "ZAPP (%s)" nickname))
            `(:process
-             ,(lambda (server)
+             ,(lambda (server) ;; needs upcoming jsonrpc 1.20
                 (pcase-let ((`(,connection . ,inferior)
                              (zapp--inferior-bootstrap
                               nickname
@@ -308,7 +308,7 @@ CONNECT-ARGS are passed as additional arguments to
            (setq nickname (file-name-base (car contact)))
            (setq name (format "ZAPP (%s)" nickname))
            `(:process
-             ,(lambda (_server)
+             ,(lambda (&optional _server)
                 (make-process
                  :name name
                  :command (zapp--cmd contact)
