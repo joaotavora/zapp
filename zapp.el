@@ -52,12 +52,12 @@
 (defclass zapp--dap-server (jsonrpc-process-connection)
   ((status :initform "created" :initarg :status)
    (yow-timer :initform nil)
-   (server-info :initform nil :initarg :server-info)
    (last-id :initform 0)
    (n-sent-notifs :initform 0)
    (buffers :initform nil)
    (capabilities :initform nil)
-   (nickname :initform "?" :initarg :nickname)))
+   (nickname :initform "?" :initarg :nickname)
+   (autostart-inferior-process :initform nil)))
 
 (cl-defmethod initialize-instance :after ((server zapp--dap-server) &optional _)
   (with-slots (name buffers nickname) server
@@ -233,30 +233,93 @@
     (when yow-timer (cancel-timer yow-timer))
     (setq zapp--current-server nil)))
 
-
 (defun zapp--cmd (contact) contact) ; maybe future tramp things
 
+(defun zapp--inferior-bootstrap (name contact &optional connect-args)
+  ;; FIXME: absolutely identical to eglot--inferior-bootstrap.  Move
+  ;; it to jsonrpc.el asap
+  "Use CONTACT to start a server, then connect to it.
+Return a cons of two process objects (CONNECTION . INFERIOR).
+Name both based on NAME.
+CONNECT-ARGS are passed as additional arguments to
+`open-network-stream'."
+  (let* ((port-probe (make-network-process :name "zapp-port-probe-dummy"
+                                           :server t
+                                           :host "localhost"
+                                           :service 0))
+         (port-number (unwind-protect
+                          (process-contact port-probe :service)
+                        (delete-process port-probe)))
+         inferior connection)
+    (unwind-protect
+        (progn
+          (setq inferior
+                (make-process
+                 :name (format "autostart-inferior-%s" name)
+                 :stderr (format "*%s stderr*" name)
+                 :noquery t
+                 :command (cl-subst
+                           (format "%s" port-number) :autoport contact)))
+          (setq connection
+                (cl-loop
+                 repeat 10 for i from 1
+                 do (accept-process-output nil 0.5)
+                 while (process-live-p inferior)
+                 do (zapp--message
+                     "Trying to connect to localhost and port %s (attempt %s)"
+                     port-number i)
+                 thereis (ignore-errors
+                           (apply #'open-network-stream
+                                  (format "autoconnect-%s" name)
+                                  nil
+                                  "localhost" port-number connect-args))))
+          (cons connection inferior))
+      (cond ((and (process-live-p connection)
+                  (process-live-p inferior))
+             (zapp--message "Done, connected to %s!" port-number))
+            (t
+             (when inferior (delete-process inferior))
+             (when connection (delete-process connection))
+             (zapp--error "Could not start and connect to server%s"
+                           (if inferior
+                               (format " started with %s"
+                                       (process-command inferior))
+                             "!")))))))
+
 (defun zapp--initargs (contact)
-  (cond ((cl-every #'stringp contact)
-         (let* ((nickname (truncate-string-to-width
-                           (string-join contact " ")
-                           10 nil nil t))
-                (name (format "ZAPP (%s)" nickname))
-                (cmd (zapp--cmd contact)))
+  (let (nickname name)
+    (cond ((and (stringp (car contact)) (memq :autoport contact))
+           (setq nickname (format "%s-autoport"
+                                  (file-name-base (car contact))))
+           (setq name (format "ZAPP (%s)" nickname))
            `(:process
-             ,(lambda ()
+             ,(lambda (server)
+                (pcase-let ((`(,connection . ,inferior)
+                             (zapp--inferior-bootstrap
+                              nickname
+                              contact
+                              '(:noquery t))))
+                  (setf (slot-value server 'autostart-inferior-process)
+                        inferior)
+                  connection))
+             :nickname ,nickname
+             :name ,name))
+          ((stringp (car contact))
+           (setq nickname (file-name-base (car contact)))
+           (setq name (format "ZAPP (%s)" nickname))
+           `(:process
+             ,(lambda (_server)
                 (make-process
                  :name name
-                 :command cmd
+                 :command (zapp--cmd contact)
                  :connection-type 'pipe
                  :coding 'utf-8-emacs-unix
                  :noquery t
                  :stderr (get-buffer-create (format "*%s stderr*" name))
                  :file-handler t))
              :name ,name
-             :nickname ,nickname
-             :server-info ,cmd)))
-        (t (zapp--error "Unsupported contact %s" contact))))
+             :nickname ,nickname))
+          (t (zapp--error "Unsupported contact %s" contact)))))
 
 (defun zapp--connect (contact class)
   (let* ((s (apply
@@ -266,10 +329,10 @@
              :request-dispatcher #'ignore
              :on-shutdown #'zapp--on-shutdown
              (zapp--initargs contact))))
-    (with-slots (status yow-timer buffers capabilities) s
+    (with-slots (status yow-timer buffers capabilities nickname) s
       (setf zapp--current-server s)
       (setf status "contacting")
-      (setf capabilities (jsonrpc-request s :initialize nil))
+      (setf capabilities (jsonrpc-request s :initialize `(:adapterID ,nickname)))
       (setf status "initializing")
       (zapp--1seclater ()
         (zapp-setup-windows s)
@@ -283,9 +346,11 @@
                         (let ((inhibit-read-only t)) (yow t))))))))))))
 
 (defun zapp--guess-contact ()
-  (list (split-string-and-unquote
-         (read-shell-command "[zapp] Command? "))
-        'zapp--dap-server))
+  (let ((input (split-string-and-unquote
+                (read-shell-command "[zapp] Command? "))))
+    (when-let ((probe (member ":autoport" input)))
+      (setf (car probe) :autoport))
+    (list input 'zapp--dap-server)))
 
 (defun zapp (contact class)
   (interactive

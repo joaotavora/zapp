@@ -8,7 +8,11 @@ pip install debugpy
 M-x zapp RET python -m debugpy.adaapter RET
 ```
 
-Will do silly things.
+Will do silly things.  Also:
+
+```
+M-x zapp RET /path/to/codelldb --port :autoport RET
+```
 
 # M-x dape
 
