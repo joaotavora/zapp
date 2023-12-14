@@ -25,7 +25,123 @@
 (require 'cl-lib)
 (require 'eieio)
 (with-no-warnings (require 'yow))
+(require 'jsonrpc)
 
+
+;;;; Utils of questionable utility
+(cl-defmacro zapp--1seclater ((&optional repeat) &body body)
+  "Silly util." (declare (indent 1))
+  `(run-at-time 1 ,repeat (lambda () ,@body (force-mode-line-update))))
+
+(defun zapp--error (format &rest args)
+  (error "[zapp] %s" (apply #'format format args)))
+
+(defun zapp--user-error (format &rest args)
+  (user-error "[zapp] %s" (apply #'format format args)))
+
+(defun zapp--message (format &rest args)
+  (message "[zapp] %s" (apply #'format format args)))
+
+(defun zapp--warn (format &rest args)
+  (apply #'zapp--message (concat "(warning) " format) args)
+  (let ((warning-minimum-level :error))
+    (display-warning 'zapp (apply #'format format args) :warning)))
+
+
+;;;; Data model
+(defclass zapp--dap-server (jsonrpc-process-connection)
+  ((status :initform "created" :initarg :status)
+   (yow-timer :initform nil)
+   (server-info :initform nil :initarg :server-info)
+   (last-id :initform 0)
+   (n-sent-notifs :initform 0)
+   (buffers :initform nil)
+   (capabilities :initform nil)
+   (nickname :initform "?" :initarg :nickname)))
+
+(cl-defmethod initialize-instance :after ((server zapp--dap-server) &optional _)
+  (with-slots (name buffers nickname) server
+    (cl-loop for spec in '("Threads" "Watch" "Breakpoints"
+                           "Exceptions" "REPL" "Shell"
+                           ("Global" . zapp--scope-vars-mode)
+                           ("Local" . zapp--scope-vars-mode))
+             for (nick . mode) = (ensure-list spec)
+             do (push (with-current-buffer
+                          (get-buffer-create
+                           (format "*ZAPP %s for `%s'*" (downcase nick)
+                                   nickname))
+                        (let ((inhibit-read-only t))
+                          (erase-buffer)
+                          (funcall (or mode 'zapp--info-mode))
+                          (setq-local zapp--buffer-nick nick))
+                        (current-buffer))
+                      buffers))))
+
+(defvar zapp--buffer-nick "???")
+
+(defvar zapp--current-server nil
+  "Server instance for current debug session")
+
+(defun zapp--current-server () zapp--current-server)
+
+(defun zapp--current-server-or-lose ()
+  (or (zapp--current-server)
+      (error "No current debugging session.")))
+
+
+;;; Stupid DAP base protocol
+(cl-defmethod jsonrpc-convert-to-endpoint ((conn zapp--dap-server)
+                                           message subtype)
+  "Convert JSONRPC MESSAGE to DAP's JSONRPCesque format."
+  (cl-destructuring-bind (&key method id error params
+                               (result nil result-supplied-p))
+      message
+    (with-slots (last-id n-sent-notifs) conn
+      (cond ((eq subtype 'notification)
+             (cl-incf n-sent-notifs)
+             `(:type "event"
+                     :seq ,(+ last-id n-sent-notifs)
+                     :event ,method
+                     :body ,params))
+            ((eq subtype 'request)
+             `(:type "request"
+                     :seq ,(+ (setq last-id id) n-sent-notifs)
+                     :command ,method
+                     ,@(when params `(:arguments ,params))))
+            (t
+             (cond (error
+                    `(:type "response"
+                            :seq ,(+ (setq last-id id) n-sent-notifs)
+                            :request_seq ,last-id
+                            :success :json-false
+                            :message ,(plist-get error :message)
+                            :body ,(plist-get error :data)))
+                   (result-supplied-p
+                    `(:type "response"
+                            :seq ,(+ (setq last-id id) n-sent-notifs)
+                            :request_seq ,last-id
+                            :command ,method
+                            :success t
+                            ,@(and result `(:body ,result))))))))))
+
+(cl-defmethod jsonrpc-convert-from-endpoint ((_conn zapp--dap-server) dap-message)
+  "Convert JSONRPCesque DAP-MESSAGE to JSONRPC plist."
+  (cl-destructuring-bind (&key type request_seq seq command arguments
+                               event body success message &allow-other-keys)
+      dap-message
+    (cond ((string= type "event")
+           `(:jsonrpc "2.0" :method ,event :params ,body))
+          ((eq success :json-false)
+           `(:jsonrpc "2.0" :id ,request_seq
+                      :error ,(list :code 32600
+                                    :message (or (plist-get body :error) message))))
+          ((eq success t)
+           `(:jsonrpc "2.0" :id ,request_seq :result ,body))
+          (command
+           `(:jsonrpc "2.0" :id ,seq :method ,command :params ,arguments)))))
+
+
+;;;; Zapp info buffers
 (defvar zapp--mode-line-key [mode-line mouse-1])
 
 (defun zapp--info-tabbar (w)
@@ -84,46 +200,6 @@
       ("REPL" .        (,fns . ((side . bottom) (slot . 0))))
       ("Shell" .       (,fns . ((side . bottom) (slot . 1)))))))
 
-(defclass zapp--dap-server ()
-  ((name  :initarg :name)
-   (status :initform "created")
-   (timer :initform nil)
-   (buffers :initform nil)))
-
-(cl-defmethod initialize-instance :before ((server zapp--dap-server) &optional args)
-  (cl-destructuring-bind (&key ((:name n))) args
-    (unless n (error "name is required!"))
-    (with-slots (name buffers) server
-      (setq name n)
-      (cl-loop for spec in '("Threads" "Watch" "Breakpoints"
-                             "Exceptions" "REPL" "Shell"
-                             ("Global" . zapp--scope-vars-mode)
-                             ("Local" . zapp--scope-vars-mode))
-               for (nick . mode) = (ensure-list spec)
-               do (push (with-current-buffer
-                           (get-buffer-create
-                            (format "*ZAPP %s for %s*" (downcase nick)
-                                    (slot-value server 'name)))
-                         (let ((inhibit-read-only t))
-                           (erase-buffer)
-                           (funcall (or mode 'zapp--info-mode))
-                           (setq-local zapp--buffer-nick nick))
-                         (current-buffer))
-                        buffers)))))
-
-(defvar zapp--buffer-nick "???")
-
-(defvar zapp--current-server nil
-  "Server instance for current debug session")
-
-(defvar zapp--current-server nil)
-
-(defun zapp--current-server () zapp--current-server)
-
-(defun zapp--current-server-or-lose ()
-  (or (zapp--current-server)
-      (error "No current debugging session.")))
-
 (defun zapp-setup-windows (server)
   (interactive (list (zapp--current-server-or-lose)))
   (cl-loop with display-buffer-alist = (zapp--info-dba)
@@ -134,6 +210,9 @@
            (setf (window-parameter w 'zapp--info-tabbar) nil)
            (set-window-dedicated-p w 'dedicated)))
 
+
+
+;;;; Mode-line horseplay
 (defun zapp--mlf ()
   (with-slots (name status) zapp--current-server
     (format "%s: %s" name (propertize status 'face 'success))))
@@ -144,35 +223,89 @@
 (add-to-list 'mode-line-misc-info
              `(zapp--current-server (" [" zapp--mlf  "] ")))
 
-(cl-defmacro zapp--1seclater ((&optional repeat) &body body)
-  "Silly util." (declare (indent 1))
-  `(run-at-time 1 ,repeat (lambda () ,@body (force-mode-line-update))))
+
+(defun zapp--on-shutdown (server)
+  "Called when SERVER dead."
+  (with-slots (buffers yow-timer) server
+    (dolist (b buffers)
+      (when-let ((w (get-buffer-window b)))
+        (delete-window w)))
+    (when yow-timer (cancel-timer yow-timer))
+    (setq zapp--current-server nil)))
 
-(defun zapp (name)
-  (interactive "sName this server: ")
-  (if (zapp--current-server) (user-error "Quit current session first!"))
-  (let ((s (make-instance 'zapp--dap-server :name name)))
-    (with-slots (status timer buffers) s
-      (setf zapp--current-server s status "connecting")
+
+(defun zapp--cmd (contact) contact) ; maybe future tramp things
+
+(defun zapp--initargs (contact)
+  (cond ((cl-every #'stringp contact)
+         (let* ((nickname (truncate-string-to-width
+                           (string-join contact " ")
+                           10 nil nil t))
+                (name (format "ZAPP (%s)" nickname))
+                (cmd (zapp--cmd contact)))
+           `(:process
+             ,(lambda ()
+                (make-process
+                 :name name
+                 :command cmd
+                 :connection-type 'pipe
+                 :coding 'utf-8-emacs-unix
+                 :noquery t
+                 :stderr (get-buffer-create (format "*%s stderr*" name))
+                 :file-handler t))
+             :name ,name
+             :nickname ,nickname
+             :server-info ,cmd)))
+        (t (zapp--error "Unsupported contact %s" contact))))
+
+(defun zapp--connect (contact class)
+  (let* ((s (apply
+             #'make-instance
+             class
+             :notification-dispatcher #'ignore
+             :request-dispatcher #'ignore
+             :on-shutdown #'zapp--on-shutdown
+             (zapp--initargs contact))))
+    (with-slots (status yow-timer buffers capabilities) s
+      (setf zapp--current-server s)
+      (setf status "contacting")
+      (setf capabilities (jsonrpc-request s :initialize nil))
+      (setf status "initializing")
       (zapp--1seclater ()
-        (setf status  "initializing")
         (zapp-setup-windows s)
         (zapp--1seclater ()
           (setf status  "connected"
-                timer
+                yow-timer
                 (zapp--1seclater (4)
                   (dolist (b buffers)
                     (with-current-buffer b
                       (save-excursion
                         (let ((inhibit-read-only t)) (yow t))))))))))))
 
-(defun zapp-shutdown ()
-  (interactive)
-  (unless zapp--current-server
-    (user-error "Nothing to shutdown"))
-  (zapp--1seclater ()
-    (dolist (b (slot-value zapp--current-server 'buffers))
-      (when-let ((w (get-buffer-window b)))
-        (delete-window w)))
-    (cancel-timer (slot-value zapp--current-server 'timer))
-    (setq zapp--current-server nil)))
+(defun zapp--guess-contact ()
+  (list (split-string-and-unquote
+         (read-shell-command "[zapp] Command? "))
+        'zapp--dap-server))
+
+(defun zapp (contact class)
+  (interactive
+   (let ((current-server (zapp--current-server)))
+     (unless (or (null current-server) (y-or-n-p "\
+[zapp] Shut down current connection before attempting new one?"))
+       (zapp--user-error "Connection attempt aborted by user."))
+     (prog1 (zapp--guess-contact)
+       (when current-server (ignore-errors (zapp-shutdown current-server))))))
+  (zapp--connect contact class))
+
+(defun zapp-shutdown (server &optional timeout preserve-buffers)
+  (interactive (list (zapp--current-server-or-lose) nil current-prefix-arg))
+  (zapp--message "Asking %s politely to terminate" (jsonrpc-name server))
+  (unwind-protect
+      (jsonrpc-request server :disconnect nil :timeout (or timeout 1.5))
+    ;; Now ask jsonrpc.el to shut down the server.
+    (jsonrpc-shutdown server (not preserve-buffers))
+    (unless preserve-buffers
+      (kill-buffer (jsonrpc-events-buffer server))
+      (mapc #'kill-buffer (slot-value server 'buffers)))))
+
+(defun zapp--nuke () (interactive) (setq zapp--current-server nil))
