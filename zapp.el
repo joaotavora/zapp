@@ -235,57 +235,6 @@
 
 (defun zapp--cmd (contact) contact) ; maybe future tramp things
 
-(defun zapp--inferior-bootstrap (name contact &optional connect-args)
-  ;; FIXME: absolutely identical to eglot--inferior-bootstrap.  Move
-  ;; it to jsonrpc.el asap
-  "Use CONTACT to start a server, then connect to it.
-Return a cons of two process objects (CONNECTION . INFERIOR).
-Name both based on NAME.
-CONNECT-ARGS are passed as additional arguments to
-`open-network-stream'."
-  (let* ((port-probe (make-network-process :name "zapp-port-probe-dummy"
-                                           :server t
-                                           :host "localhost"
-                                           :service 0))
-         (port-number (unwind-protect
-                          (process-contact port-probe :service)
-                        (delete-process port-probe)))
-         inferior connection)
-    (unwind-protect
-        (progn
-          (setq inferior
-                (make-process
-                 :name (format "autostart-inferior-%s" name)
-                 :stderr (format "*%s stderr*" name)
-                 :noquery t
-                 :command (cl-subst
-                           (format "%s" port-number) :autoport contact)))
-          (setq connection
-                (cl-loop
-                 repeat 10 for i from 1
-                 do (accept-process-output nil 0.5)
-                 while (process-live-p inferior)
-                 do (zapp--message
-                     "Trying to connect to localhost and port %s (attempt %s)"
-                     port-number i)
-                 thereis (ignore-errors
-                           (apply #'open-network-stream
-                                  (format "autoconnect-%s" name)
-                                  nil
-                                  "localhost" port-number connect-args))))
-          (cons connection inferior))
-      (cond ((and (process-live-p connection)
-                  (process-live-p inferior))
-             (zapp--message "Done, connected to %s!" port-number))
-            (t
-             (when inferior (delete-process inferior))
-             (when connection (delete-process connection))
-             (zapp--error "Could not start and connect to server%s"
-                           (if inferior
-                               (format " started with %s"
-                                       (process-command inferior))
-                             "!")))))))
-
 (defun zapp--initargs (contact)
   (let (nickname name)
     (cond ((and (stringp (car contact)) (memq :autoport contact))
@@ -293,15 +242,8 @@ CONNECT-ARGS are passed as additional arguments to
                                   (file-name-base (car contact))))
            (setq name (format "ZAPP (%s)" nickname))
            `(:process
-             ,(lambda (server) ;; needs upcoming jsonrpc 1.20
-                (pcase-let ((`(,connection . ,inferior)
-                             (zapp--inferior-bootstrap
-                              nickname
-                              contact
-                              '(:noquery t))))
-                  (setf (slot-value server 'autostart-inferior-process)
-                        inferior)
-                  connection))
+             ,(jsonrpc-autoport-bootstrap nickname contact
+                                          :connect-args '(:noquery t))
              :nickname ,nickname
              :name ,name))
           ((stringp (car contact))
