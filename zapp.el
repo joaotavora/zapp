@@ -236,8 +236,13 @@
 (defun zapp--cmd (contact) contact) ; maybe future tramp things
 
 (defun zapp--initargs (contact)
+  "Initargs for (sub)class of `zapp--dap-server'"
   (let (nickname name)
-    (cond ((and (stringp (car contact)) (memq :autoport contact))
+    (cond ((and (stringp (car contact))
+                (cl-find-if (lambda (x)
+                              (or (eq x :autoport)
+                                  (eq (car-safe x) :autoport)))
+                            contact))
            (setq nickname (format "%s-autoport"
                                   (file-name-base (car contact))))
            (setq name (format "ZAPP (%s)" nickname))
@@ -263,38 +268,82 @@
              :nickname ,nickname))
           (t (zapp--error "Unsupported contact %s" contact)))))
 
-(defun zapp--connect (contact class)
-  (let* ((s (apply
-             #'make-instance
-             class
-             :notification-dispatcher #'ignore
-             :request-dispatcher #'ignore
-             :on-shutdown #'zapp--on-shutdown
-             (zapp--initargs contact))))
-    (with-slots (status yow-timer buffers capabilities nickname) s
-      (setf zapp--current-server s)
-      (setf status "contacting")
-      (setf capabilities (jsonrpc-request s :initialize `(:adapterID ,nickname)))
-      (setf status "initializing")
-      (zapp--1seclater ()
-        (zapp-setup-windows s)
+(defun zapp--connect (contact debuggee class)
+  (cl-flet ((spread (fn) (lambda (s m p) (apply fn s m p))))
+    (let* ((s (apply
+               #'make-instance
+               class
+               :notification-dispatcher (spread #'zapp-handle-notification)
+               :request-dispatcher #'ignore
+               :on-shutdown #'zapp--on-shutdown
+               (zapp--initargs contact))))
+      (with-slots (status yow-timer buffers capabilities nickname) s
+        (setf zapp--current-server s)
+        (setf status "contacting")
+        (setf capabilities (jsonrpc-request s :initialize `(:adapterID ,nickname)))
+        (let ((program (expand-file-name (car debuggee))))
+          (jsonrpc-request
+           s :launch
+           (list :cwd (file-name-directory program)
+                 :program program
+                 :args (apply #'vector (cdr debuggee)))))
+        (setf status "yay?")
         (zapp--1seclater ()
-          (setf status  "connected"
-                yow-timer
-                (zapp--1seclater (4)
-                  (dolist (b buffers)
-                    (with-current-buffer b
-                      (save-excursion
-                        (let ((inhibit-read-only t)) (yow t))))))))))))
+          (zapp-setup-windows s)
+          (zapp--1seclater ()
+            (setf status  "yay2?"
+                  yow-timer
+                  (zapp--1seclater (4)
+                    (dolist (b buffers)
+                      (with-current-buffer b
+                        (save-excursion
+                          (let ((inhibit-read-only t)) (yow t)))))))))))))
+
+(defvar zapp-command-history nil)
 
 (defun zapp--guess-contact ()
-  (let ((input (split-string-and-unquote
-                (read-shell-command "[zapp] Command? "))))
-    (when-let ((probe (member ":autoport" input)))
+  (pcase-let*
+      ((input (split-string-and-unquote
+               (minibuffer-with-setup-hook
+                   (lambda ()
+                     (setq-local text-property-default-nonsticky
+                                 (append '((separator . t) (face . t))
+                                         text-property-default-nonsticky))
+                     (jit-lock-register
+                      (lambda (beg _end)
+                        (save-excursion
+                          (goto-char (- beg 3))
+                          (while (search-forward-regexp "\\s---\\s-" nil t)
+                            (add-text-properties
+                             (match-beginning 0)
+                             (match-end 0)
+                             '(display " →  " face
+                                       minibuffer-prompt 'separator t)))))))
+                 (read-shell-command "[zapp] Command? "
+                                     nil
+                                     'zapp-command-history))))
+       (`(,contact . ,debuggee)
+        (cl-loop with separator-seen = nil
+                 for e in input
+                 if (and (not separator-seen)
+                         (string= e "--"))
+                 do (setq separator-seen t)
+                 else if separator-seen collect e into l2
+                 else if (string-match ":autoport" e)
+                 collect
+                 (cons :autoport
+                       (let ((e e)) ; This bug is my longest relationship ever
+                         (lambda (p) (string-replace ":autoport"
+                                                     (number-to-string p)
+                                                     e))))
+                 into l1
+                 else collect e into l1
+                 finally return (cons l1 l2))))
+    (when-let ((probe (member ":autoport" contact)))
       (setf (car probe) :autoport))
-    (list input 'zapp--dap-server)))
+    (list contact debuggee 'zapp--dap-server)))
 
-(defun zapp (contact class)
+(defun zapp (contact debuggee class)
   (interactive
    (let ((current-server (zapp--current-server)))
      (unless (or (null current-server) (y-or-n-p "\
@@ -302,7 +351,7 @@
        (zapp--user-error "Connection attempt aborted by user."))
      (prog1 (zapp--guess-contact)
        (when current-server (ignore-errors (zapp-shutdown current-server))))))
-  (zapp--connect contact class))
+  (zapp--connect contact debuggee class))
 
 (defun zapp-shutdown (server &optional timeout preserve-buffers)
   (interactive (list (zapp--current-server-or-lose) nil current-prefix-arg))
@@ -316,3 +365,15 @@
       (mapc #'kill-buffer (slot-value server 'buffers)))))
 
 (defun zapp--nuke () (interactive) (setq zapp--current-server nil))
+
+
+;;;; Handlers
+
+(cl-defmethod zapp-handle-notification ((s zapp--dap-server) m
+                                        &key &allow-other-keys)
+  (jsonrpc--debug s "Unknown notification method: %s" m))
+
+(cl-defmethod zapp-handle-notification ((s zapp--dap-server) (_m (eql initialized))
+                                        &key &allow-other-keys)
+  ;; lalala some stuff missing here
+  (jsonrpc-request s :configurationDone nil))
