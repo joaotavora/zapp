@@ -220,8 +220,7 @@
 (defvar zapp--mlf `(:eval (zapp--mlf)))
 (put 'zapp--mlf 'risky-local-variable t)
 
-(add-to-list 'mode-line-misc-info
-             `(zapp--current-server (" [" zapp--mlf  "] ")))
+(add-to-list 'mode-line-misc-info `(zapp--current-server (" [" zapp--mlf "] ")))
 
 
 (defun zapp--on-shutdown (server)
