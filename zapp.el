@@ -235,8 +235,8 @@
 
 (defun zapp--cmd (contact) contact) ; maybe future tramp things
 
-(defun zapp--initargs (contact)
-  "Initargs for (sub)class of `zapp--dap-server'"
+(defun zapp--contact-initargs (_class contact) ; make generic
+  "Initargs for CLASS, subclass of `zapp--dap-server'."
   (let (nickname name)
     (cond ((and (stringp (car contact))
                 (cl-find-if (lambda (x)
@@ -268,7 +268,19 @@
              :nickname ,nickname))
           (t (zapp--error "Unsupported contact %s" contact)))))
 
-(defun zapp--connect (contact debuggee class)
+(defun zapp--kickoff-args (_class debuggee _contact) ; make generic
+  "Plist for initial `:launch' or `:attach' request."
+  (let (pid program)
+    (cond ((and (= 1 (length debuggee))
+                (> (setq pid (string-to-number (car debuggee))) 0))
+           `(:zapp-method :attach :pid ,pid))
+          ((and (stringp (car debuggee))
+                (setq program (expand-file-name (car debuggee))))
+           `(:zapp-method :launch :cwd ,(file-name-directory program)
+                          :program ,program
+                          :args ,(apply #'vector (cdr debuggee)))))))
+
+(defun zapp--connect (contact kickoff-method kickoff-args class)
   (cl-flet ((spread (fn) (lambda (s m p) (apply fn s m p))))
     (let* ((s (apply
                #'make-instance
@@ -276,17 +288,12 @@
                :notification-dispatcher (spread #'zapp-handle-notification)
                :request-dispatcher #'ignore
                :on-shutdown #'zapp--on-shutdown
-               (zapp--initargs contact))))
+               (zapp--contact-initargs class contact))))
       (with-slots (status yow-timer buffers capabilities nickname) s
         (setf zapp--current-server s)
         (setf status "contacting")
         (setf capabilities (jsonrpc-request s :initialize `(:adapterID ,nickname)))
-        (let ((program (expand-file-name (car debuggee))))
-          (jsonrpc-request
-           s :launch
-           (list :cwd (file-name-directory program)
-                 :program program
-                 :args (apply #'vector (cdr debuggee)))))
+        (jsonrpc-request s kickoff-method kickoff-args)
         (setf status "yay?")
         (zapp--1seclater ()
           (zapp-setup-windows s)
@@ -299,59 +306,103 @@
                         (save-excursion
                           (let ((inhibit-read-only t)) (yow t)))))))))))))
 
+
+;;;; Command-parsing heroics
 (defvar zapp-command-history nil)
 
-(defun zapp--guess-contact ()
-  (pcase-let*
-      ((input (split-string-and-unquote
-               (minibuffer-with-setup-hook
-                   (lambda ()
-                     (setq-local text-property-default-nonsticky
-                                 (append '((separator . t) (face . t))
-                                         text-property-default-nonsticky))
-                     (jit-lock-register
-                      (lambda (beg _end)
-                        (save-excursion
-                          (goto-char (- beg 3))
-                          (while (search-forward-regexp "\\s---\\s-" nil t)
-                            (add-text-properties
-                             (match-beginning 0)
-                             (match-end 0)
-                             '(display " →  " face
-                                       minibuffer-prompt 'separator t)))))))
-                 (read-shell-command "[zapp] Command? "
-                                     nil
-                                     'zapp-command-history))))
-       (`(,contact . ,debuggee)
-        (cl-loop with separator-seen = nil
-                 for e in input
-                 if (and (not separator-seen)
-                         (string= e "--"))
-                 do (setq separator-seen t)
-                 else if separator-seen collect e into l2
-                 else if (string-match ":autoport" e)
-                 collect
-                 (cons :autoport
-                       (let ((e e)) ; This bug is my longest relationship ever
-                         (lambda (p) (string-replace ":autoport"
-                                                     (number-to-string p)
-                                                     e))))
-                 into l1
-                 else collect e into l1
-                 finally return (cons l1 l2))))
-    (when-let ((probe (member ":autoport" contact)))
-      (setf (car probe) :autoport))
-    (list contact debuggee 'zapp--dap-server)))
+(defun zapp--parse-command ()
+  (let* (separator
+         (unquoting-read
+          (lambda ()
+            (skip-chars-forward " \t\n")
+            (let ((beg (point)))
+              (cond ((eq (char-after) ?\")
+                     (list (read (current-buffer)) beg (point)))
+                    ((char-after)
+                     (list (buffer-substring-no-properties
+                            beg (+ beg (skip-chars-forward "^ \t\n")))
+                           beg (point) t))))))
+         (contact
+          (cl-loop until separator
+                   for spec = (funcall unquoting-read)
+                   while spec
+                   for (tok b e simple-p) = spec
+                   if (string-equal tok "--")
+                   do (setq separator (cons b e))
+                   else if (and simple-p (string-match ":autoport" tok))
+                   collect
+                   (let ((tok tok)) ; This bug is my longest relationship ever
+                     (cons :autoport
+                           (lambda (p)
+                             (string-replace ":autoport"
+                                             (number-to-string p)
+                                             tok))))
+                   else collect tok))
+         (debuggee
+          (cl-loop with first-kwarg = nil
+                   until first-kwarg
+                   for spec = (funcall unquoting-read)
+                   while spec
+                   for (tok b e simple-p) = spec
+                   if (and simple-p (> (length tok) 1) (string-prefix-p ":" tok))
+                   do (setq first-kwarg (cons b e))
+                   (goto-char b)
+                   else collect tok))
+         (extra (cl-loop do (skip-chars-forward " \t\n")
+                         while (not (eobp)) collect (read (current-buffer))))
+         (class (zapp--guess-class contact extra))
+         (kickoff-plist (zapp--kickoff-args class debuggee contact))
+         (merged (cl-loop for (k v) on extra by #'cddr
+                          do (setq kickoff-plist (plist-put kickoff-plist k v))
+                          finally return kickoff-plist))
+         (method (plist-get merged :zapp-method)))
+    (cl-remf merged :zapp-method)
+    (list separator contact method merged (zapp--guess-class contact extra))))
 
-(defun zapp (contact debuggee class)
+(defvar zapp--minibuffer-acf-overlay (make-overlay (point) (point)))
+
+(defun zapp--minibuffer-acf (_beg _end _prelen)
+  (save-excursion
+    (goto-char (minibuffer-prompt-end))
+    (pcase-let ((`((,bsep . ,esep) ,_contact ,method ,args ,class _)
+                 (ignore-errors (zapp--parse-command))))
+      (when bsep
+        (add-text-properties bsep esep
+                             '(display " →  " face minibuffer-prompt separator t)))
+      (overlay-put
+       zapp--minibuffer-acf-overlay
+       'after-string
+       (propertize (format " \ndebugger: %s\nmethod: %s\narguments: %S"
+                           class method args)
+                   'face 'minibuffer-prompt
+                   'cursor 0))
+      (move-overlay zapp--minibuffer-acf-overlay
+                    (1- (point-max)) (point-max) (current-buffer)))))
+
+(defun zapp--guess-class (_contact _extra) 'zapp--dap-server)
+
+(defun zapp--interactive ()
+  (let ((str
+         (minibuffer-with-setup-hook
+             (lambda ()
+               (setq-local text-property-default-nonsticky
+                           (append '((separator . t) (face . t))
+                                   text-property-default-nonsticky))
+               (add-hook 'after-change-functions #'zapp--minibuffer-acf nil t))
+           (read-shell-command "[zapp] Command? " nil 'zapp-command-history))))
+    (with-temp-buffer (save-excursion (insert str)) (cdr (zapp--parse-command)))))
+
+
+;;;; Interactive fun
+(defun zapp (contact method kickoff-args class)
   (interactive
    (let ((current-server (zapp--current-server)))
      (unless (or (null current-server) (y-or-n-p "\
 [zapp] Shut down current connection before attempting new one?"))
        (zapp--user-error "Connection attempt aborted by user."))
-     (prog1 (zapp--guess-contact)
+     (prog1 (zapp--interactive)
        (when current-server (ignore-errors (zapp-shutdown current-server))))))
-  (zapp--connect contact debuggee class))
+  (zapp--connect contact method kickoff-args class))
 
 (defun zapp-shutdown (server &optional timeout preserve-buffers)
   (interactive (list (zapp--current-server-or-lose) nil current-prefix-arg))
