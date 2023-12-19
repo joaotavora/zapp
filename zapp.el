@@ -34,6 +34,38 @@
 
 (defcustom zapp-show-command-hints t "Show `M-x zapp' hints" :type 'boolean)
 
+(defcustom zapp--server-programs
+  `(((python-mode python-ts-mode)
+     :class zapp-debugpy
+     :program "python -m debugpy.adapter"
+     :kickoff-args (:type "executable" :justMyCode nil :showReturnValue t))
+    ((c++-mode c++-ts-mode c-mode c-ts-mode)
+     :class zapp-codelldb-cc
+     :program "codelldb --port :autoport"
+     :hint "codelldb"
+     :kickoff-args (:type "lldb"))
+    ((rust-mode rust-ts-mode)
+     :class zapp-codelldb-rust
+     :program "codelldb --port :autoport --settings {\"sourceLanguages\":[\"rust\"]}"
+     :hint "codelldb.*sourceLanguages.*rust"
+     :kickoff-args (:type "lldb")))
+  "Hmmm"
+  :type '(alist :key-type (repeat :tag "Major modes" symbol)
+                :value-type
+                (plist :key-type (symbol :tag "Keyword")
+                       :options (((const :tag "Program suggestion" :program)
+                                  (radio string (repeat :tag "List of strings" string)))
+                                 ((const :tag "Class" :class) symbol)
+                                 ((const :tag "Kickoff args" :kickoff-args)
+                                  (choice
+                                   (plist :key-type (symbol :tag "key")
+                                          :value-type (sexp :tag "sexp"))
+                                   (sexp)))
+                                 ((const :tag "Nickname" :nickname) string)
+                                 ((const :tag "Class-divination hint" :hint)
+                                  regexp)))))
+
+
 
 ;;;; Utils of questionable utility
 (cl-defmacro zapp--1seclater ((&optional repeat) &body body)
@@ -249,7 +281,7 @@
                               (or (eq x :autoport)
                                   (eq (car-safe x) :autoport)))
                             contact))
-           (setq nickname (zapp-nickname class contact :autoport t))
+           (setq nickname (zapp--nickname class contact :autoport t))
            (setq name (format "ZAPP (%s)" nickname))
            `(:process
              ,(jsonrpc-autoport-bootstrap nickname contact
@@ -257,8 +289,10 @@
              :nickname ,nickname
              :name ,name))
           ((stringp (car contact))
-           (setq nickname (zapp-nickname class contact :autoport t))
+           (setq nickname (zapp--nickname class contact :autoport nil))
            (setq name (format "ZAPP (%s)" nickname))
+           (unless (executable-find (car contact))
+             (zapp--user-error "Can't find `%s'" (car contact)))
            `(:process
              ,(lambda (&optional _server)
                 (make-process
@@ -273,27 +307,41 @@
              :nickname ,nickname))
           (t (zapp--error "Unsupported contact %s" contact)))))
 
-(cl-defmethod zapp-nickname (_class contact &key autoport)
-  (let ((s (file-name-base (car contact))))
+(cl-defun zapp--nickname (class contact &key autoport)
+  (let ((s (or
+            (cl-loop
+             for (_ . plist) in zapp--server-programs
+             for c = (plist-get plist :class)
+             thereis (and (eq class c) (zapp--nickname-from-plist plist)))
+            (file-name-base (car contact)))))
     (if autoport (format "%s-autoport" s) s)))
 
-(cl-defmethod zapp-kickoff-args (_class debuggee _contact)
+(defun zapp--kickoff-args (class debuggee _contact)
   "Plist for initial `:launch' or `:attach' request."
-  (let (pid program)
-    (cond ((and (= 1 (length debuggee))
-                (> (setq pid (string-to-number (car debuggee))) 0))
-           `(:zapp-method :attach :pid ,pid))
-          ((and (stringp (car debuggee))
-                (setq program (expand-file-name (car debuggee))))
-           `(:zapp-method :launch :cwd ,(file-name-directory program)
-                          :program ,program
-                          :args ,(apply #'vector (cdr debuggee)))))))
+  (cl-loop with pid = nil with program = nil
+           with base =
+           (cond ((and (= 1 (length debuggee))
+                       (> (setq pid (string-to-number (car debuggee))) 0))
+                  `(:zapp-method :attach :pid ,pid))
+                 ((and (stringp (car debuggee))
+                       (setq program (expand-file-name (car debuggee))))
+                  `(:zapp-method :launch :cwd ,(file-name-directory program)
+                                 :program ,program
+                                 :args ,(apply #'vector (cdr debuggee)))))
+           for (_ . plist) in zapp--server-programs
+           for c = (plist-get plist :class)
+           when (eq class c)
+           do (cl-loop for (k v) on (plist-get plist :kickoff-args) by #'cddr
+                       do (setq base (plist-put base k v)))
+           finally return base))
 
 (defun zapp--connect (contact kickoff-method kickoff-args class)
   (cl-flet ((spread (fn) (lambda (s m p) (apply fn s m p))))
     (let* ((s (apply
                #'make-instance
-               class
+               (if (find-class class) class
+                 ;; let's not use (eval `(defclass ...)) mischief for now
+                 'zapp-generic-server)
                :notification-dispatcher (spread #'zapp-handle-notification)
                :request-dispatcher #'ignore
                :on-shutdown #'zapp--on-shutdown
@@ -319,6 +367,26 @@
 ;;;; Command-parsing heroics
 (defvar zapp-command-history nil)
 
+(defun zapp--nickname-from-plist (plist)
+  (or (plist-get plist :nickname)
+      (when-let ((c (plist-get plist :class)) (n (symbol-name c)))
+        (and (string-match "^zapp-" n) (substring n (match-end 0))))))
+
+(defun zapp--guess-class (contact _extra)
+  (cl-loop for (_ . plist)
+           in (cl-sort (copy-sequence zapp--server-programs) #'>
+                       :key (lambda (e)
+                              (length (plist-get (cddr e) :hint))))
+           for c = (plist-get plist :class)
+           for hintre = (or (plist-get plist :hint)
+                            (zapp--nickname-from-plist plist))
+           thereis (and hintre
+                        (string-match hintre (string-join
+                                              (cl-remove-if-not #'stringp contact)
+                                              " "))
+                        c)
+           finally return 'zapp-generic-server))
+
 (defun zapp--parse-command ()
   (let* (separator
          (unquoting-read
@@ -336,7 +404,7 @@
                    for spec = (funcall unquoting-read)
                    while spec
                    for (tok b e simple-p) = spec
-                   if (string-equal tok "--")
+                   if (string-equal tok "->")
                    do (setq separator (cons b e))
                    else if (and simple-p (string-match ":autoport" tok))
                    collect
@@ -361,8 +429,7 @@
                          while (not (eobp)) collect (read (current-buffer))))
          (class (or (plist-get extra :zapp-class)
                     (zapp--guess-class contact extra)))
-         (kickoff-plist (mapcar #'identity
-                                (zapp-kickoff-args class debuggee contact)))
+         (kickoff-plist (copy-sequence (zapp--kickoff-args class debuggee contact)))
          (merged (cl-loop for (k v) on extra by #'cddr
                           do (setq kickoff-plist (plist-put kickoff-plist k v))
                           finally return kickoff-plist))
@@ -373,15 +440,23 @@
 
 (defvar zapp--minibuffer-acf-overlay (make-overlay (point) (point)))
 
+(defvar zapp--minibuffer-help-blurb
+  (concat
+   "\n\nSeparate debugger and debuggee with \"->\", extra keyword plist at end."
+   "\n(toggle hints: C-c ?, guess: C-c C-c, navigate history: M-p, M-n or C-r)"))
+
+(defvar zapp--origin-mode nil)
+
 (defun zapp--minibuffer-acf (&rest _ignored)
   (save-excursion
     (goto-char (minibuffer-prompt-end))
     (pcase-let ((ov zapp--minibuffer-acf-overlay)
-                (`((,bsep . ,esep) ,_contact ,method ,args ,class _)
+                (`((,bsep . ,esep) ,_contact ,method ,args ,class)
                  (ignore-errors (zapp--parse-command))))
+      (set-text-properties (point) (point-max) nil)
       (when bsep
         (add-text-properties bsep esep
-                             '(display " →  " face minibuffer-prompt separator t)))
+                             '(display "→ " face minibuffer-prompt separator t)))
       (if zapp-show-command-hints
           (let* ((fill-column (min (window-width)
                                    (* 2 fill-column)))
@@ -398,46 +473,60 @@
                                               (substring (symbol-name k) 1))
                                       'face 'shadow)
                           (format "%S" v)))
-              
+              (insert (propertize zapp--minibuffer-help-blurb 'face 'shadow))
               (overlay-put ov 'after-string (buffer-string)))
             (move-overlay ov (1- (point-max)) (point-max) (current-buffer)))
         (delete-overlay ov)))))
 
+(defun zapp--minibuffer-guess ()
+  (interactive)
+  (cl-loop with p = (minibuffer-prompt-end)
+           with empty-p = (= p (point-max))
+           for (m . plist) in zapp--server-programs
+           for modes = (ensure-list m)
+           when (provided-mode-derived-p zapp--origin-mode modes)
+           do
+           (save-excursion
+             (goto-char p)
+             (when (search-forward-regexp "\\s-->\\s-" nil t)
+               (delete-region p (point)))
+             (insert
+              (string-join
+               (ensure-list (plist-get plist :program))
+               " ")
+              " -> "))
+           (when empty-p
+             (goto-char (point-max))
+             (save-excursion (insert "my-program -f 42")))
+           and return nil
+           finally do (zapp--user-error "Can't guess for `%s'!"
+                                        zapp--origin-mode))
+  (zapp--minibuffer-acf))
+
+(defun zapp--minibuffer-toggle-hints ()
+  (interactive)
+  (setq zapp-show-command-hints (not zapp-show-command-hints))
+  (zapp--minibuffer-acf))
+
 (defun zapp--interactive ()
-  (let* ((newbie-prompt
-          (concat "[zapp] Specify debugger and debuggee separated by \"--\""
-                  " (toggle hints with C-c ?)"
-                  "\nCommand: "))
-         (leet-prompt "[zapp] Command: ")
-         (prompt (lambda ()
-                   (if zapp-show-command-hints newbie-prompt leet-prompt)))
-         (toggle-hints (lambda () (interactive)
-                          (setq zapp-show-command-hints
-                                (not zapp-show-command-hints))
-                          (zapp--minibuffer-acf)
-                          (let ((inhibit-read-only t)
-                                (props (text-properties-at (point-min))))
-                            (save-excursion
-                              (goto-char (point-min))
-                              (insert (apply #'propertize (funcall prompt) props))
-                              (delete-region (point) (minibuffer-prompt-end))))))
-         (minibuffer-local-shell-command-map
+  (let* ((minibuffer-local-shell-command-map
           (let ((m (make-sparse-keymap)))
             (set-keymap-parent m minibuffer-local-shell-command-map)
-            (define-key m (kbd "C-c ?") toggle-hints)
+            (define-key m (kbd "C-c ?") #'zapp--minibuffer-toggle-hints)
+            (define-key m (kbd "C-c C-c") #'zapp--minibuffer-guess)
             m))
+         (origin-mode major-mode)
          (str
           (minibuffer-with-setup-hook
               (lambda ()
                 (setq-local text-property-default-nonsticky
                             (append '((separator . t) (face . t))
                                     text-property-default-nonsticky)
-                            resize-mini-windows t)
+                            resize-mini-windows t
+                            zapp--origin-mode origin-mode)
                 (add-hook 'after-change-functions #'zapp--minibuffer-acf nil t)
                 (zapp--minibuffer-acf))
-            (read-shell-command
-             (funcall prompt)
-             nil 'zapp-command-history))))
+            (read-shell-command "[zapp] Command: " nil 'zapp-command-history))))
     (with-temp-buffer (save-excursion (insert str)) (cdr (zapp--parse-command)))))
 
 
@@ -478,29 +567,5 @@
   ;; lalala some stuff missing here
   (jsonrpc-request s :configurationDone nil))
 
-
-;;;; DAP server-specific
-(defun zapp--guess-class (contact _extra)
-  (let ((alist `(("debugpy" . zapp-debugpy)
-                 ("codelldb" . zapp-codelldb))))
-    (cl-loop for (heuristic . sym) in alist
-             when (cl-find heuristic contact :test #'string-match)
-             return sym
-             finally return 'zapp-generic-server)))
 
-(defclass zapp-debugpy (zapp-generic-server) ())
 
-(cl-defmethod zapp-nickname ((_c (eql 'zapp-debugpy)) _ &key &allow-other-keys)
-  "debugpy")
-
-(cl-defmethod zapp-kickoff-args ((_c (eql 'zapp-debugpy)) _debuggee _contact)
-  (append (cl-call-next-method) '(:type "executable" :justMyCode nil
-                                        :showReturnValue t)))
-
-(defclass zapp-codelldb (zapp-generic-server) ())
-
-(cl-defmethod zapp-nickname ((_c (eql 'zapp-codelldb)) _ &key &allow-other-keys)
-  "codelldb")
-
-(cl-defmethod zapp-kickoff-args ((_c (eql 'zapp-codelldb)) _debuggee _contact)
-  (append (cl-call-next-method) '(:type "lldb")))
