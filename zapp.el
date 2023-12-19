@@ -359,7 +359,8 @@
                    else collect tok))
          (extra (cl-loop do (skip-chars-forward " \t\n")
                          while (not (eobp)) collect (read (current-buffer))))
-         (class (zapp--guess-class contact extra))
+         (class (or (plist-get extra :zapp-class)
+                    (zapp--guess-class contact extra)))
          (kickoff-plist (mapcar #'identity
                                 (zapp-kickoff-args class debuggee contact)))
          (merged (cl-loop for (k v) on extra by #'cddr
@@ -367,7 +368,8 @@
                           finally return kickoff-plist))
          (method (plist-get merged :zapp-method)))
     (cl-remf merged :zapp-method)
-    (list separator contact method merged (zapp--guess-class contact extra))))
+    (cl-remf merged :zapp-class)
+    (list separator contact method merged class)))
 
 (defvar zapp--minibuffer-acf-overlay (make-overlay (point) (point)))
 
@@ -387,11 +389,16 @@
             (when (string-search "\n " pp-args)
               (setq pp-args (replace-regexp-in-string "\n[ ]+" "\n      " pp-args)))
             (with-temp-buffer
-              (insert
-               (propertize " " 'cursor 0)
-               (propertize "\n\nclass: " 'face 'shadow) (format "%s" class)
-               (propertize "\nmethod: " 'face 'shadow) (format "%s" method)
-               (propertize "\nargs: " 'face 'shadow) pp-args)
+              (insert (propertize " \n" 'cursor 0) )
+              (cl-loop
+               for (k v)
+               on `(:zapp-class ,class :zapp-method ,method ,@args) by #'cddr
+               do (insert "\n"
+                          (propertize (format "%s: "
+                                              (substring (symbol-name k) 1))
+                                      'face 'shadow)
+                          (format "%S" v)))
+              
               (overlay-put ov 'after-string (buffer-string)))
             (move-overlay ov (1- (point-max)) (point-max) (current-buffer)))
         (delete-overlay ov)))))
@@ -399,7 +406,7 @@
 (defun zapp--interactive ()
   (let* ((newbie-prompt
           (concat "[zapp] Specify debugger and debuggee separated by \"--\""
-                  " (toggle hints with M-?)"
+                  " (toggle hints with C-c ?)"
                   "\nCommand: "))
          (leet-prompt "[zapp] Command: ")
          (prompt (lambda ()
@@ -417,7 +424,7 @@
          (minibuffer-local-shell-command-map
           (let ((m (make-sparse-keymap)))
             (set-keymap-parent m minibuffer-local-shell-command-map)
-            (define-key m (kbd "M-?") toggle-hints)
+            (define-key m (kbd "C-c ?") toggle-hints)
             m))
          (str
           (minibuffer-with-setup-hook
