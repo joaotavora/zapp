@@ -28,6 +28,13 @@
 (require 'jsonrpc)
 
 
+;;;; User tweakable stuff
+(defgroup zapp nil "Zapp Branningan's DAP plugin" :prefix "zapp-"
+  :group 'applications)
+
+(defcustom zapp-show-command-hints t "Show `M-x zapp' hints" :type 'boolean)
+
+
 ;;;; Utils of questionable utility
 (cl-defmacro zapp--1seclater ((&optional repeat) &body body)
   "Silly util." (declare (indent 1))
@@ -49,7 +56,7 @@
 
 
 ;;;; Data model
-(defclass zapp--dap-server (jsonrpc-process-connection)
+(defclass zapp-generic-server (jsonrpc-process-connection)
   ((status :initform "created" :initarg :status)
    (yow-timer :initform nil)
    (last-id :initform 0)
@@ -59,7 +66,7 @@
    (nickname :initform "?" :initarg :nickname)
    (autostart-inferior-process :initform nil)))
 
-(cl-defmethod initialize-instance :after ((server zapp--dap-server) &optional _)
+(cl-defmethod initialize-instance :after ((server zapp-generic-server) &optional _)
   (with-slots (name buffers nickname) server
     (cl-loop for spec in '("Threads" "Watch" "Breakpoints"
                            "Exceptions" "REPL" "Shell"
@@ -90,7 +97,7 @@
 
 
 ;;; Stupid DAP base protocol
-(cl-defmethod jsonrpc-convert-to-endpoint ((conn zapp--dap-server)
+(cl-defmethod jsonrpc-convert-to-endpoint ((conn zapp-generic-server)
                                            message subtype)
   "Convert JSONRPC MESSAGE to DAP's JSONRPCesque format."
   (cl-destructuring-bind (&key method id error params
@@ -124,7 +131,7 @@
                             :success t
                             ,@(and result `(:body ,result))))))))))
 
-(cl-defmethod jsonrpc-convert-from-endpoint ((_conn zapp--dap-server) dap-message)
+(cl-defmethod jsonrpc-convert-from-endpoint ((_conn zapp-generic-server) dap-message)
   "Convert JSONRPCesque DAP-MESSAGE to JSONRPC plist."
   (cl-destructuring-bind (&key type request_seq seq command arguments
                                event body success message &allow-other-keys)
@@ -234,16 +241,15 @@
 
 (defun zapp--cmd (contact) contact) ; maybe future tramp things
 
-(defun zapp--contact-initargs (_class contact) ; make generic
-  "Initargs for CLASS, subclass of `zapp--dap-server'."
+(defun zapp--contact-initargs (class contact) ; make generic?
+  "Initargs for CLASS, subclass of `zapp-generic-server'."
   (let (nickname name)
     (cond ((and (stringp (car contact))
                 (cl-find-if (lambda (x)
                               (or (eq x :autoport)
                                   (eq (car-safe x) :autoport)))
                             contact))
-           (setq nickname (format "%s-autoport"
-                                  (file-name-base (car contact))))
+           (setq nickname (zapp-nickname class contact :autoport t))
            (setq name (format "ZAPP (%s)" nickname))
            `(:process
              ,(jsonrpc-autoport-bootstrap nickname contact
@@ -251,7 +257,7 @@
              :nickname ,nickname
              :name ,name))
           ((stringp (car contact))
-           (setq nickname (file-name-base (car contact)))
+           (setq nickname (zapp-nickname class contact :autoport t))
            (setq name (format "ZAPP (%s)" nickname))
            `(:process
              ,(lambda (&optional _server)
@@ -267,7 +273,11 @@
              :nickname ,nickname))
           (t (zapp--error "Unsupported contact %s" contact)))))
 
-(defun zapp--kickoff-args (_class debuggee _contact) ; make generic
+(cl-defmethod zapp-nickname (_class contact &key autoport)
+  (let ((s (file-name-base (car contact))))
+    (if autoport (format "%s-autoport" s) s)))
+
+(cl-defmethod zapp-kickoff-args (_class debuggee _contact)
   "Plist for initial `:launch' or `:attach' request."
   (let (pid program)
     (cond ((and (= 1 (length debuggee))
@@ -350,7 +360,8 @@
          (extra (cl-loop do (skip-chars-forward " \t\n")
                          while (not (eobp)) collect (read (current-buffer))))
          (class (zapp--guess-class contact extra))
-         (kickoff-plist (zapp--kickoff-args class debuggee contact))
+         (kickoff-plist (mapcar #'identity
+                                (zapp-kickoff-args class debuggee contact)))
          (merged (cl-loop for (k v) on extra by #'cddr
                           do (setq kickoff-plist (plist-put kickoff-plist k v))
                           finally return kickoff-plist))
@@ -360,35 +371,66 @@
 
 (defvar zapp--minibuffer-acf-overlay (make-overlay (point) (point)))
 
-(defun zapp--minibuffer-acf (_beg _end _prelen)
+(defun zapp--minibuffer-acf (&rest _ignored)
   (save-excursion
     (goto-char (minibuffer-prompt-end))
-    (pcase-let ((`((,bsep . ,esep) ,_contact ,method ,args ,class _)
+    (pcase-let ((ov zapp--minibuffer-acf-overlay)
+                (`((,bsep . ,esep) ,_contact ,method ,args ,class _)
                  (ignore-errors (zapp--parse-command))))
       (when bsep
         (add-text-properties bsep esep
                              '(display " →  " face minibuffer-prompt separator t)))
-      (overlay-put
-       zapp--minibuffer-acf-overlay
-       'after-string
-       (propertize (format " \ndebugger: %s\nmethod: %s\narguments: %S"
-                           class method args)
-                   'face 'minibuffer-prompt
-                   'cursor 0))
-      (move-overlay zapp--minibuffer-acf-overlay
-                    (1- (point-max)) (point-max) (current-buffer)))))
-
-(defun zapp--guess-class (_contact _extra) 'zapp--dap-server)
+      (if zapp-show-command-hints
+          (let* ((fill-column (min (window-width)
+                                   (* 2 fill-column)))
+                 (pp-args (pp-to-string args)))
+            (when (string-search "\n " pp-args)
+              (setq pp-args (replace-regexp-in-string "\n[ ]+" "\n      " pp-args)))
+            (with-temp-buffer
+              (insert
+               (propertize " " 'cursor 0)
+               (propertize "\n\nclass: " 'face 'shadow) (format "%s" class)
+               (propertize "\nmethod: " 'face 'shadow) (format "%s" method)
+               (propertize "\nargs: " 'face 'shadow) pp-args)
+              (overlay-put ov 'after-string (buffer-string)))
+            (move-overlay ov (1- (point-max)) (point-max) (current-buffer)))
+        (delete-overlay ov)))))
 
 (defun zapp--interactive ()
-  (let ((str
-         (minibuffer-with-setup-hook
-             (lambda ()
-               (setq-local text-property-default-nonsticky
-                           (append '((separator . t) (face . t))
-                                   text-property-default-nonsticky))
-               (add-hook 'after-change-functions #'zapp--minibuffer-acf nil t))
-           (read-shell-command "[zapp] Command? " nil 'zapp-command-history))))
+  (let* ((newbie-prompt
+          (concat "[zapp] Specify debugger and debuggee separated by \"--\""
+                  " (toggle hints with M-?)"
+                  "\nCommand: "))
+         (leet-prompt "[zapp] Command: ")
+         (prompt (lambda ()
+                   (if zapp-show-command-hints newbie-prompt leet-prompt)))
+         (toggle-hints (lambda () (interactive)
+                          (setq zapp-show-command-hints
+                                (not zapp-show-command-hints))
+                          (zapp--minibuffer-acf)
+                          (let ((inhibit-read-only t)
+                                (props (text-properties-at (point-min))))
+                            (save-excursion
+                              (goto-char (point-min))
+                              (insert (apply #'propertize (funcall prompt) props))
+                              (delete-region (point) (minibuffer-prompt-end))))))
+         (minibuffer-local-shell-command-map
+          (let ((m (make-sparse-keymap)))
+            (set-keymap-parent m minibuffer-local-shell-command-map)
+            (define-key m (kbd "M-?") toggle-hints)
+            m))
+         (str
+          (minibuffer-with-setup-hook
+              (lambda ()
+                (setq-local text-property-default-nonsticky
+                            (append '((separator . t) (face . t))
+                                    text-property-default-nonsticky)
+                            resize-mini-windows t)
+                (add-hook 'after-change-functions #'zapp--minibuffer-acf nil t)
+                (zapp--minibuffer-acf))
+            (read-shell-command
+             (funcall prompt)
+             nil 'zapp-command-history))))
     (with-temp-buffer (save-excursion (insert str)) (cdr (zapp--parse-command)))))
 
 
@@ -419,11 +461,39 @@
 
 ;;;; Handlers
 
-(cl-defmethod zapp-handle-notification ((s zapp--dap-server) m
+(cl-defmethod zapp-handle-notification ((s zapp-generic-server) m
                                         &key &allow-other-keys)
   (jsonrpc--debug s "Unknown notification method: %s" m))
 
-(cl-defmethod zapp-handle-notification ((s zapp--dap-server) (_m (eql initialized))
+(cl-defmethod zapp-handle-notification ((s zapp-generic-server)
+                                        (_m (eql initialized))
                                         &key &allow-other-keys)
   ;; lalala some stuff missing here
   (jsonrpc-request s :configurationDone nil))
+
+
+;;;; DAP server-specific
+(defun zapp--guess-class (contact _extra)
+  (let ((alist `(("debugpy" . zapp-debugpy)
+                 ("codelldb" . zapp-codelldb))))
+    (cl-loop for (heuristic . sym) in alist
+             when (cl-find heuristic contact :test #'string-match)
+             return sym
+             finally return 'zapp-generic-server)))
+
+(defclass zapp-debugpy (zapp-generic-server) ())
+
+(cl-defmethod zapp-nickname ((_c (eql 'zapp-debugpy)) _ &key &allow-other-keys)
+  "debugpy")
+
+(cl-defmethod zapp-kickoff-args ((_c (eql 'zapp-debugpy)) _debuggee _contact)
+  (append (cl-call-next-method) '(:type "executable" :justMyCode nil
+                                        :showReturnValue t)))
+
+(defclass zapp-codelldb (zapp-generic-server) ())
+
+(cl-defmethod zapp-nickname ((_c (eql 'zapp-codelldb)) _ &key &allow-other-keys)
+  "codelldb")
+
+(cl-defmethod zapp-kickoff-args ((_c (eql 'zapp-codelldb)) _debuggee _contact)
+  (append (cl-call-next-method) '(:type "lldb")))
