@@ -123,7 +123,9 @@
 (cl-defmethod initialize-instance :after ((server zapp-generic-server) &optional _)
   (with-slots (name buffers nickname) server
     (cl-loop for spec in '("Threads" "Watch" "Breakpoints"
-                           "Exceptions" "REPL" "Shell"
+                           "Exceptions"
+                           ("REPL" . zapp--repl-mode)
+                           "Shell"
                            ("Global" . zapp--scope-vars-mode)
                            ("Local" . zapp--scope-vars-mode))
              for (nick . mode) = (ensure-list spec)
@@ -379,7 +381,8 @@
             (setf status  "yay2?"
                   yow-timer
                   (zapp--1seclater (4)
-                    (dolist (b buffers)
+                    (dolist (b (cl-remove (zapp--buffer :repl)
+                                          buffers))
                       (with-current-buffer b
                         (save-excursion
                           (let ((inhibit-read-only t)) (yow t)))))))))))))
@@ -595,5 +598,60 @@
   ;; lalala some stuff missing here
   (jsonrpc-request s :configurationDone nil))
 
+
+;;;; Zapp REPL
+(require 'comint)
 
+;; most of this stolen from SLY, maybe inadequate/overkill
+(defvar zrepl//output-mark nil)
+(defvar zrepl//read-mark nil)
+(defvar zrepl//pending-output nil)
+(defvar zrepl//last-prompt-overlay nil)
 
+(defun zrepl//syntax-propertize (_beg _end)
+  ;; maybe make everything up to prompt comment syntax?
+  nil)
+
+(defun zrepl//forward-sexp (_n)
+  ;; maybe inhibit some things?
+  )
+
+(defun zrepl//input-sender (_proc _string)
+  ;; something should definitely go here
+  )
+
+(define-derived-mode zapp--repl-mode comint-mode "zrepl"
+  (setq-local
+   comint-use-prompt-regexp             nil
+   comint-inhibit-carriage-motion       t
+   comint-input-sender                  #'zrepl//input-sender
+   comint-output-filter-functions       nil
+   comint-input-filter-functions        nil
+   comint-history-isearch               'dwim
+   comint-input-ignoredups              t
+   comint-prompt-read-only              t
+   comint-process-echoes                nil
+   comint-completion-addsuffix          ""
+
+   zrepl//read-mark                     nil
+   zrepl//pending-output                nil
+   zrepl//output-mark                   (point-marker)
+   zrepl//last-prompt-overlay           (make-overlay 0 0 nil nil)
+
+   mode-line-process                    nil
+   parse-sexp-ignore-comments           t
+   syntax-propertize-function           #'zrepl//syntax-propertize
+   forward-sexp-function                #'zrepl//forward-sexp
+   comint-scroll-show-maximum-output    nil
+   comint-scroll-to-bottom-on-input     nil
+   comint-scroll-to-bottom-on-output    nil
+   inhibit-field-text-motion            nil
+
+   mode-line-format '(:eval (zapp--info-mlf))
+
+   buffer-file-coding-system            'utf-8-unix)
+  (set-marker-insertion-type zapp--repl-output-mark nil))
+
+;; Local Variables:
+;; read-symbol-shorthands: (("z//" . "zapp--") ("z/" . "zapp-") ("zrepl//" . "zapp--repl-") ("zrepl/" . "zapp-repl-"))
+;; End:
