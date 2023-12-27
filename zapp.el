@@ -96,7 +96,12 @@
    (buffers :initform nil)
    (capabilities :initform nil)
    (nickname :initform "?" :initarg :nickname)
-   (autostart-inferior-process :initform nil)))
+   (autostart-inferior-process :initform nil)
+   ;; mostly for reconnection purposes
+   (contact :initarg :contact)
+   (kickoff-method :initarg :kickoff-method)
+   (kickoff-args :initarg :kickoff-args)
+   (class :initarg :class)))
 
 (cl-defmethod initialize-instance :after ((server zapp-generic-server) &optional _)
   (with-slots (name buffers nickname) server
@@ -340,11 +345,16 @@
     (let* ((s (apply
                #'make-instance
                (if (find-class class) class
+                 ;; 
                  ;; let's not use (eval `(defclass ...)) mischief for now
                  'zapp-generic-server)
                :notification-dispatcher (spread #'zapp-handle-notification)
                :request-dispatcher #'ignore
                :on-shutdown #'zapp--on-shutdown
+               :contact contact
+               :class class
+               :kickoff-method kickoff-method
+               :kickoff-args kickoff-args
                (zapp--contact-initargs class contact))))
       (with-slots (status yow-timer buffers capabilities nickname) s
         (setf zapp--current-server s)
@@ -531,7 +541,7 @@
 
 
 ;;;; Interactive fun
-(defun zapp (contact method kickoff-args class)
+(defun zapp (contact kickoff-method kickoff-args class)
   (interactive
    (let ((current-server (zapp--current-server)))
      (unless (or (null current-server) (y-or-n-p "\
@@ -539,7 +549,7 @@
        (zapp--user-error "Connection attempt aborted by user."))
      (prog1 (zapp--interactive)
        (when current-server (ignore-errors (zapp-shutdown current-server))))))
-  (zapp--connect contact method kickoff-args class))
+  (zapp--connect contact kickoff-method kickoff-args class))
 
 (defun zapp-shutdown (server &optional timeout preserve-buffers)
   (interactive (list (zapp--current-server-or-lose) nil current-prefix-arg))
@@ -551,6 +561,13 @@
     (unless preserve-buffers
       (kill-buffer (jsonrpc-events-buffer server))
       (mapc #'kill-buffer (slot-value server 'buffers)))))
+
+(defun zapp-reconnect (server)
+  (interactive (list (zapp--current-server-or-lose)))
+  (when (jsonrpc-running-p server)
+    (ignore-errors (zapp-shutdown server nil 'preserve-buffers)))
+  (with-slots (contact kickoff-method kickoff-args class) server
+    (zapp--connect contact kickoff-method kickoff-args class)))
 
 (defun zapp--nuke () (interactive) (setq zapp--current-server nil))
 
