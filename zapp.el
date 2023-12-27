@@ -103,6 +103,23 @@
    (kickoff-args :initarg :kickoff-args)
    (class :initarg :class)))
 
+(cl-defun zapp--buffer (name &key (server (zapp--current-server-or-lose))
+                             mode)
+  "Get Zapp buffer for NAME.  If MODE provided, wipe and set it."
+  (let ((name
+         (cond ((keywordp name) (capitalize (substring (symbol-name name) 1)))
+               ((symbolp name) (capitalize (symbol-name name)))
+               (t name))))
+    (with-current-buffer
+        (get-buffer-create (format "*ZAPP %s for `%s'*" (downcase name)
+                                   (slot-value server 'nickname)))
+      (when mode
+        (let ((inhibit-read-only t))
+          (erase-buffer)
+          (funcall (or mode 'zapp--info-mode))
+          (setq-local zapp--buffer-nick name)))
+      (current-buffer))))
+
 (cl-defmethod initialize-instance :after ((server zapp-generic-server) &optional _)
   (with-slots (name buffers nickname) server
     (cl-loop for spec in '("Threads" "Watch" "Breakpoints"
@@ -110,15 +127,9 @@
                            ("Global" . zapp--scope-vars-mode)
                            ("Local" . zapp--scope-vars-mode))
              for (nick . mode) = (ensure-list spec)
-             do (push (with-current-buffer
-                          (get-buffer-create
-                           (format "*ZAPP %s for `%s'*" (downcase nick)
-                                   nickname))
-                        (let ((inhibit-read-only t))
-                          (erase-buffer)
-                          (funcall (or mode 'zapp--info-mode))
-                          (setq-local zapp--buffer-nick nick))
-                        (current-buffer))
+             do (push (zapp--buffer nick
+                                    :server server
+                                    :mode (or mode 'zapp--info-mode))
                       buffers))))
 
 (defvar zapp--buffer-nick "???")
