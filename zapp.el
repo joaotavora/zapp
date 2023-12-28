@@ -365,12 +365,13 @@
                        do (setq base (plist-put base k v)))
            finally return base))
 
+(defvar zapp-connect-hook '(zapp-setup-windows))
+
 (defun zapp--connect (contact kickoff-method kickoff-args class)
   (cl-flet ((spread (fn) (lambda (s m p) (apply fn s m p))))
     (let* ((s (apply
                #'make-instance
                (if (find-class class) class
-                 ;; 
                  ;; let's not use (eval `(defclass ...)) mischief for now
                  'zapp-generic-server)
                :notification-dispatcher (spread #'zapp-handle-notification)
@@ -387,20 +388,7 @@
         (setf capabilities (jsonrpc-request s :initialize `(:adapterID ,nickname)))
         (jsonrpc-request s kickoff-method kickoff-args)
         (setf status "yay?")
-        (zapp--1seclater ()
-          (zapp-setup-windows s)
-          (zrepl//setup)
-          (zapp--1seclater ()
-            (setf status  "yay2?"
-                  yow-timer
-                  (zapp--1seclater (4)
-                    (dolist (b (cl-remove (zapp--buffer :repl s)
-                                          buffers))
-                      (with-current-buffer b
-                        (save-excursion
-                          (let ((inhibit-read-only t))
-                            (erase-buffer)
-                            (insert (yow))))))))))))))
+        (run-hook-with-args 'zapp-connect-hook s)))))
 
 
 ;;;; Command-parsing heroics
@@ -620,6 +608,8 @@
 ;;;; Zapp REPL
 (require 'comint)
 
+(add-hook 'zapp-connect-hook 'zrepl//setup t)
+
 ;; most of this stolen from SLY, maybe inadequate/overkill
 (defvar zrepl//output-mark nil)
 (defvar zrepl//read-mark nil)
@@ -702,6 +692,24 @@
       (add-text-properties start (point) '(read-only t))))
   (when-let ((p (zrepl//dummyproc)))
     (delete-process p)))
+
+
+;;; pinhead
+(add-hook 'zapp-connect-hook 'zapp--pinhead t)
+
+(defun zapp--pinhead (s)
+  (with-slots (status yow-timer buffers) s
+    (zapp--1seclater ()
+      (setf status  "yay2?"
+            yow-timer
+            (zapp--1seclater (4)
+              (dolist (b (cl-remove (zapp--buffer :repl s) buffers))
+                (with-current-buffer b
+                  (save-excursion
+                    (let ((inhibit-read-only t))
+                      (erase-buffer)
+                      (insert (yow)))))))))))
+
 
 ;; Local Variables:
 ;; read-symbol-shorthands: (("z//" . "zapp--") ("z/" . "zapp-") ("zrepl//" . "zapp--repl-") ("zrepl/" . "zapp-repl-"))
