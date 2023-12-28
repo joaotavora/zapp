@@ -635,9 +635,21 @@
   ;; maybe inhibit some things?
   )
 
-(defun zrepl//input-sender (_proc _string)
-  ;; something should definitely go here
-  )
+(defun zrepl//input-sender (_proc string)
+  (let ((buf (current-buffer)))
+    ;; contrary to SLY, which uses a separate marker for the output,
+    ;; `string' will always contain the prompt, so do a little dance
+    (setq string (with-temp-buffer
+                   (save-excursion (insert string))
+                   (goto-char (field-end))
+                   (buffer-substring (point) (point-max))))
+    (zapp--1seclater ()
+      (z//when-live-buffer buf
+        (zrepl//output
+         (format "Yes, definitely thinking hard about '%s'" string))
+        (zapp--1seclater ()
+          (z//when-live-buffer buf
+            (zrepl//insert-prompt (z//current-server-or-lose))))))))
 
 (define-derived-mode zapp--repl-mode comint-mode "zrepl"
   (setq-local
@@ -677,15 +689,36 @@
 
 (defun zrepl//prompt (server) (concat (slot-value server 'nickname) "> "))
 
-(defmacro zrepl//commiting-text (props &rest body)
+(defun zrepl//ensure-newline () (unless (zerop (current-column)) (insert "\n")))
+
+(cl-defmacro zrepl//commiting-text ((&key props advance to-point) &rest body)
   (declare (debug (sexp &rest form)) (indent 1))
   (let ((start-sym (gensym)))
     `(let ((,start-sym (marker-position (zrepl//mark)))
            (inhibit-read-only t))
+       (goto-char ,start-sym)
        ,@body
-       (add-text-properties ,start-sym (zrepl//mark)
-                            (append '(read-only t front-sticky (read-only))
-                                    ,props)))))
+       ,@(when advance `((set-marker (process-mark (zrepl//proc)) (point))))
+       (add-text-properties
+        ,start-sym ,(if to-point '(point) '(zrepl//mark))
+        (append `(read-only t front-sticky (read-only))
+                ,props)))))
+
+(defun zrepl//insert-prompt (server)
+  (zrepl//commiting-text
+      (:props '(font-lock-face
+                comint-highlight-prompt
+                ;; brainlessly cargo-culted from SLY
+                inhibit-line-move-field-capture t
+                field output
+                rear-nonsticky (field
+                                inhibit-line-move-field-capture
+                                read-only
+                                font-lock-face
+                                insert-in-front-hooks))
+              :to-point t)
+    (zrepl//ensure-newline)
+    (insert (slot-value server 'nickname) "> ")))
 
 (cl-defun zrepl//setup (&optional (server (zapp--current-server-or-lose)))
   (with-current-buffer (zapp--buffer :repl server)
@@ -702,21 +735,21 @@
       (goto-char (point-max))
       (add-text-properties (point-min) (point) '(font-lock-face font-lock-comment-face))
       (set-marker (process-mark (get-buffer-process (current-buffer))) (point)))
-    (zrepl//commiting-text '(font-lock-face warning)
-      (insert "\n\n--- " (yow) " ---\n\n")
-      (set-marker (process-mark (zrepl//proc)) (point)))
+    (zrepl//commiting-text (:props '(font-lock-face warning) :advance t)
+      (insert "\n\n--- " (yow) " ---\n\n"))
+    (zrepl//insert-prompt server)
+    (goto-char (point-max))
     (when-let ((w (get-buffer-window (current-buffer))))
-      (with-selected-window w (recenter)))))
+      (with-selected-window w (recenter (1- (window-height)))))))
 
-(cl-defun zrepl//teardown (server &key reason)
+(cl-defun zrepl//teardown (server &key (reason "disconnected"))
   (with-current-buffer (zapp--buffer :repl server)
     (remove-hook 'kill-buffer-hook 'zrepl//kbh t)
     (when-let ((p (zrepl//proc)))
-      (zrepl//commiting-text '(font-lock-face warning)
-        (unless (zerop (current-column)) (insert "\n"))
+      (zrepl//commiting-text (:props '(font-lock-face warning) :advance t)
+        (zrepl//ensure-newline)
         (insert (format "--- %s" (or reason "REPL teardown")))
-        (unless (zerop (current-column)) (insert "\n"))
-        (set-marker (process-mark p) (point)))
+        (zrepl//ensure-newline))
       (delete-process p))))
 
 (defun zrepl//kbh () (zrepl//teardown (zapp--current-server-or-lose)))
@@ -729,7 +762,7 @@
 
 (defun zrepl//output (output)
   (if (zrepl//proc)
-      (zrepl//commiting-text '(font-lock-face zrepl/output-face)
+      (zrepl//commiting-text (:props '(font-lock-face zrepl/output-face))
         (comint-output-filter (zrepl//proc) output))
     (zapp--warn "Ignoring some output for a non-ready REPL")))
 
