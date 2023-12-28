@@ -65,6 +65,9 @@
                                  ((const :tag "Class-divination hint" :hint)
                                   regexp)))))
 
+(defcustom zapp-preserved-windows '(:repl) "Hmmm"
+  :type '(repeat :tag "Keyword" symbol))
+
 
 
 ;;;; Utils of questionable utility
@@ -86,6 +89,11 @@
   (let ((warning-minimum-level :error))
     (display-warning 'zapp (apply #'format format args) :warning)))
 
+(cl-defmacro zapp--when-live-buffer (buf &rest body)
+  "Check BUF live, then do BODY in it." (declare (indent 1) (debug t))
+  (let ((b (cl-gensym)))
+    `(let ((,b ,buf)) (if (buffer-live-p ,b) (with-current-buffer ,b ,@body)))))
+
 
 ;;;; Data model
 (defclass zapp-generic-server (jsonrpc-process-connection)
@@ -103,9 +111,8 @@
    (kickoff-args :initarg :kickoff-args)
    (class :initarg :class)))
 
-(cl-defun zapp--buffer (name &key (server (zapp--current-server-or-lose))
-                             mode)
-  "Get Zapp buffer for NAME.  If MODE provided, wipe and set it."
+(cl-defun zapp--buffer (name server &key mode wipe)
+  "Get Zapp buffer for NAME, SERVER."
   (let ((name
          (cond ((keywordp name) (capitalize (substring (symbol-name name) 1)))
                ((symbolp name) (capitalize (symbol-name name)))
@@ -113,24 +120,26 @@
     (with-current-buffer
         (get-buffer-create (format "*ZAPP %s for `%s'*" (downcase name)
                                    (slot-value server 'nickname)))
-      (when mode
+      (when (or mode wipe)
         (let ((inhibit-read-only t))
-          (erase-buffer)
-          (funcall (or mode 'zapp--info-mode))
-          (setq-local zapp--buffer-nick name)))
+          (when wipe
+            (erase-buffer))
+          (when mode
+            (funcall (or mode 'zapp--info-mode))))
+        (setq-local zapp--buffer-nick name))
       (current-buffer))))
 
 (cl-defmethod initialize-instance :after ((server zapp-generic-server) &optional _)
   (with-slots (name buffers nickname) server
     (cl-loop for spec in '("Threads" "Watch" "Breakpoints"
                            "Exceptions"
-                           ("REPL" . zapp--repl-mode)
+                           ("REPL" zapp--repl-mode t)
                            "Shell"
-                           ("Global" . zapp--scope-vars-mode)
-                           ("Local" . zapp--scope-vars-mode))
-             for (nick . mode) = (ensure-list spec)
-             do (push (zapp--buffer nick
-                                    :server server
+                           ("Global" zapp--scope-vars-mode)
+                           ("Local" zapp--scope-vars-mode))
+             for (nick mode preserve) = (ensure-list spec)
+             do (push (zapp--buffer nick server
+                                    :wipe (not preserve)
                                     :mode (or mode 'zapp--info-mode))
                       buffers))))
 
@@ -284,7 +293,10 @@
   "Called when SERVER dead."
   (with-slots (buffers yow-timer) server
     (dolist (b buffers)
-      (when-let ((w (get-buffer-window b)))
+      (when-let ((w (and
+                     (cl-loop for kw in zapp-preserved-windows
+                              never (eq b (zapp--buffer kw server)))
+                     (get-buffer-window b))))
         (delete-window w)))
     (when yow-timer (cancel-timer yow-timer))
     (setq zapp--current-server nil)))
@@ -377,15 +389,18 @@
         (setf status "yay?")
         (zapp--1seclater ()
           (zapp-setup-windows s)
+          (zrepl//setup)
           (zapp--1seclater ()
             (setf status  "yay2?"
                   yow-timer
                   (zapp--1seclater (4)
-                    (dolist (b (cl-remove (zapp--buffer :repl)
+                    (dolist (b (cl-remove (zapp--buffer :repl s)
                                           buffers))
                       (with-current-buffer b
                         (save-excursion
-                          (let ((inhibit-read-only t)) (yow t)))))))))))))
+                          (let ((inhibit-read-only t))
+                            (erase-buffer)
+                            (insert (yow))))))))))))))
 
 
 ;;;; Command-parsing heroics
@@ -574,7 +589,10 @@
     (jsonrpc-shutdown server (not preserve-buffers))
     (unless preserve-buffers
       (kill-buffer (jsonrpc-events-buffer server))
-      (mapc #'kill-buffer (slot-value server 'buffers)))))
+      (dolist (b (slot-value server 'buffers))
+        (when (cl-loop for kw in zapp-preserved-windows
+                       never (eq b (zapp--buffer kw server)))
+          (kill-buffer b))))))
 
 (defun zapp-reconnect (server)
   (interactive (list (zapp--current-server-or-lose)))
@@ -651,6 +669,39 @@
 
    buffer-file-coding-system            'utf-8-unix)
   (set-marker-insertion-type zapp--repl-output-mark nil))
+
+(defun zrepl//dummyproc () (get-buffer-process (current-buffer)))
+
+(defun zrepl//prompt (server) (concat (slot-value server 'nickname) "> "))
+
+(cl-defun zrepl//setup (&optional (server (zapp--current-server-or-lose)))
+  (with-current-buffer (zapp--buffer :repl server)
+    (when-let ((p (zrepl//dummyproc)))
+      (delete-process p))
+    (start-process (format "ZAPP (%s) dummy"
+                           (slot-value server 'nickname))
+                   (current-buffer)
+                   nil)
+    (set-process-query-on-exit-flag (zrepl//dummyproc) nil)
+    (add-hook 'kill-buffer-hook 'zrepl//teardown nil t)
+
+    (goto-char (point-max))
+    (add-text-properties (point-min) (point) '(font-lock-face font-lock-comment-face))
+    (insert "\n\n" (yow))
+    (set-marker (process-mark (get-buffer-process (current-buffer))) (point))))
+
+(cl-defun zrepl//teardown (&key reason)
+  (remove-hook 'kill-buffer-hook 'zrepl//teardown t)
+  (let ((inhibit-read-only t))
+    (goto-char (point-max))
+    (let ((start (point)))
+      (unless (zerop (current-column)) (insert "\n"))
+      (insert (format "; %s" (or reason "REPL teardown")))
+      (unless (zerop (current-column)) (insert "\n"))
+      (insert "; --------------------------------------------------------\n")
+      (add-text-properties start (point) '(read-only t))))
+  (when-let ((p (zrepl//dummyproc)))
+    (delete-process p)))
 
 ;; Local Variables:
 ;; read-symbol-shorthands: (("z//" . "zapp--") ("z/" . "zapp-") ("zrepl//" . "zapp--repl-") ("zrepl/" . "zapp-repl-"))
