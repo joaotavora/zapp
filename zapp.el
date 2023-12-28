@@ -276,6 +276,13 @@
            (setf (window-parameter w 'zapp--info-tabbar) nil)
            (set-window-dedicated-p w 'dedicated)))
 
+(defun zapp-teardown-windows (server)
+  (dolist (b (slot-value server 'buffers))
+    (when-let ((w (and
+                   (cl-loop for kw in zapp-preserved-windows
+                            never (eq b (zapp--buffer kw server)))
+                   (get-buffer-window b))))
+      (delete-window w))))
 
 
 ;;;; Mode-line horseplay
@@ -289,16 +296,19 @@
 (add-to-list 'mode-line-misc-info `(zapp--current-server (" [" zapp--mlf "] ")))
 
 
+
+(defvar zapp-pre-connect-hook '())
+(defvar zapp-connect-hook '(zapp-setup-windows))
+(defvar zapp-disconnect-hook '(zapp-teardown-windows))
+
 (defun zapp--on-shutdown (server)
   "Called when SERVER dead."
   (with-slots (buffers yow-timer) server
-    (dolist (b buffers)
-      (when-let ((w (and
-                     (cl-loop for kw in zapp-preserved-windows
-                              never (eq b (zapp--buffer kw server)))
-                     (get-buffer-window b))))
-        (delete-window w)))
-    (when yow-timer (cancel-timer yow-timer))
+    (run-hook-wrapped 'zapp-disconnect-hook
+                      (lambda (fn)
+                        (condition-case-unless-debug _err
+                            (funcall fn server)
+                          (error))))
     (setq zapp--current-server nil)))
 
 (defun zapp--cmd (contact) contact) ; maybe future tramp things
@@ -365,8 +375,6 @@
                        do (setq base (plist-put base k v)))
            finally return base))
 
-(defvar zapp-connect-hook '(zapp-setup-windows))
-
 (defun zapp--connect (contact kickoff-method kickoff-args class)
   (cl-flet ((spread (fn) (lambda (s m p) (apply fn s m p))))
     (let* ((s (apply
@@ -382,13 +390,15 @@
                :kickoff-method kickoff-method
                :kickoff-args kickoff-args
                (zapp--contact-initargs class contact))))
-      (with-slots (status yow-timer buffers capabilities nickname) s
+      (with-slots (status capabilities nickname) s
         (setf zapp--current-server s)
         (setf status "contacting")
+        (run-hook-with-args 'zapp-pre-connect-hook s)
         (setf capabilities (jsonrpc-request s :initialize `(:adapterID ,nickname)))
         (jsonrpc-request s kickoff-method kickoff-args)
         (setf status "yay?")
-        (run-hook-with-args 'zapp-connect-hook s)))))
+        (run-hook-with-args 'zapp-connect-hook s)
+        (zapp--message "Connected to '%s'!" nickname)))))
 
 
 ;;;; Command-parsing heroics
@@ -608,7 +618,8 @@
 ;;;; Zapp REPL
 (require 'comint)
 
-(add-hook 'zapp-connect-hook 'zrepl//setup t)
+(add-hook 'zapp-pre-connect-hook 'zrepl//setup 50)
+(add-hook 'zapp-disconnect-hook 'zrepl//teardown -50)
 
 ;; most of this stolen from SLY, maybe inadequate/overkill
 (defvar zrepl//output-mark nil)
@@ -660,42 +671,78 @@
    buffer-file-coding-system            'utf-8-unix)
   (set-marker-insertion-type zapp--repl-output-mark nil))
 
-(defun zrepl//dummyproc () (get-buffer-process (current-buffer)))
+(defun zrepl//proc () (get-buffer-process (current-buffer)))
+
+(defun zrepl//mark () (process-mark (zrepl//proc)))
 
 (defun zrepl//prompt (server) (concat (slot-value server 'nickname) "> "))
 
+(defmacro zrepl//commiting-text (props &rest body)
+  (declare (debug (sexp &rest form)) (indent 1))
+  (let ((start-sym (gensym)))
+    `(let ((,start-sym (marker-position (zrepl//mark)))
+           (inhibit-read-only t))
+       ,@body
+       (add-text-properties ,start-sym (zrepl//mark)
+                            (append '(read-only t front-sticky (read-only))
+                                    ,props)))))
+
 (cl-defun zrepl//setup (&optional (server (zapp--current-server-or-lose)))
   (with-current-buffer (zapp--buffer :repl server)
-    (when-let ((p (zrepl//dummyproc)))
+    (when-let ((p (zrepl//proc)))
       (delete-process p))
     (start-process (format "ZAPP (%s) dummy"
                            (slot-value server 'nickname))
                    (current-buffer)
                    nil)
-    (set-process-query-on-exit-flag (zrepl//dummyproc) nil)
-    (add-hook 'kill-buffer-hook 'zrepl//teardown nil t)
+    (set-process-query-on-exit-flag (zrepl//proc) nil)
+    (add-hook 'kill-buffer-hook #'zrepl//kbh nil t)
 
-    (goto-char (point-max))
-    (add-text-properties (point-min) (point) '(font-lock-face font-lock-comment-face))
-    (insert "\n\n" (yow))
-    (set-marker (process-mark (get-buffer-process (current-buffer))) (point))))
+    (let ((inhibit-read-only t))
+      (goto-char (point-max))
+      (add-text-properties (point-min) (point) '(font-lock-face font-lock-comment-face))
+      (set-marker (process-mark (get-buffer-process (current-buffer))) (point)))
+    (zrepl//commiting-text '(font-lock-face warning)
+      (insert "\n\n--- " (yow) " ---\n\n")
+      (set-marker (process-mark (zrepl//proc)) (point)))
+    (when-let ((w (get-buffer-window (current-buffer))))
+      (with-selected-window w (recenter)))))
 
-(cl-defun zrepl//teardown (&key reason)
-  (remove-hook 'kill-buffer-hook 'zrepl//teardown t)
-  (let ((inhibit-read-only t))
-    (goto-char (point-max))
-    (let ((start (point)))
-      (unless (zerop (current-column)) (insert "\n"))
-      (insert (format "; %s" (or reason "REPL teardown")))
-      (unless (zerop (current-column)) (insert "\n"))
-      (insert "; --------------------------------------------------------\n")
-      (add-text-properties start (point) '(read-only t))))
-  (when-let ((p (zrepl//dummyproc)))
-    (delete-process p)))
+(cl-defun zrepl//teardown (server &key reason)
+  (with-current-buffer (zapp--buffer :repl server)
+    (remove-hook 'kill-buffer-hook 'zrepl//kbh t)
+    (when-let ((p (zrepl//proc)))
+      (zrepl//commiting-text '(font-lock-face warning)
+        (unless (zerop (current-column)) (insert "\n"))
+        (insert (format "--- %s" (or reason "REPL teardown")))
+        (unless (zerop (current-column)) (insert "\n"))
+        (set-marker (process-mark p) (point)))
+      (delete-process p))))
+
+(defun zrepl//kbh () (zrepl//teardown (zapp--current-server-or-lose)))
+
+(defface zrepl/output-face
+  '((((class color) (background dark)) (:foreground "VioletRed1"))
+    (((class color) (background light)) (:foreground "steel blue"))
+    (t (:bold t :italic t)))
+  "Zapp repl output face.")
+
+(defun zrepl//output (output)
+  (if (zrepl//proc)
+      (zrepl//commiting-text '(font-lock-face zrepl/output-face)
+        (comint-output-filter (zrepl//proc) output))
+    (zapp--warn "Ignoring some output for a non-ready REPL")))
+
+(cl-defmethod zapp-handle-notification ((s zapp-generic-server)
+                                        (_m (eql output))
+                                        &key output &allow-other-keys)
+  (with-current-buffer (zapp--buffer :repl s)
+    (zrepl//output output)))
 
 
 ;;; pinhead
-(add-hook 'zapp-connect-hook 'zapp--pinhead t)
+(add-hook 'zapp-connect-hook 'zapp--pinhead 99)
+(add-hook 'zapp-disconnect-hook 'zapp--pinhead-stop -99)
 
 (defun zapp--pinhead (s)
   (with-slots (status yow-timer buffers) s
@@ -709,6 +756,10 @@
                     (let ((inhibit-read-only t))
                       (erase-buffer)
                       (insert (yow)))))))))))
+
+(defun zapp--pinhead-stop (s)
+  (with-slots (yow-timer) s
+    (when yow-timer (cancel-timer yow-timer))))
 
 
 ;; Local Variables:
