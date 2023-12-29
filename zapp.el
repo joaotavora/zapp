@@ -68,7 +68,6 @@
 (defcustom zapp-preserved-windows '(:repl) "Hmmm"
   :type '(repeat :tag "Keyword" symbol))
 
-
 
 ;;;; Utils of questionable utility
 (cl-defmacro zapp--1seclater ((&optional repeat) &body body)
@@ -279,6 +278,7 @@
            (dolist (e (delq w existing)) (delete-window e))))
 
 (defun zapp-teardown-windows (server)
+  (interactive (list (zapp--current-server-or-lose)))
   (dolist (b (slot-value server 'buffers))
     (when-let ((w (and
                    (cl-loop for kw in zapp-preserved-windows
@@ -298,7 +298,6 @@
 (add-to-list 'mode-line-misc-info `(zapp--current-server (" [" zapp--mlf "] ")))
 
 
-
 (defvar zapp-pre-connect-hook '())
 (defvar zapp-connect-hook '(zapp-setup-windows))
 (defvar zapp-disconnect-hook '(zapp-teardown-windows))
@@ -604,8 +603,7 @@
 (defun zapp--nuke () (interactive) (setq zapp--current-server nil))
 
 
-;;;; Handlers
-
+;;;; Some handlers
 (cl-defmethod zapp-handle-notification ((s zapp-generic-server) m
                                         &key &allow-other-keys)
   (jsonrpc--debug s "Unknown notification method: %s" m))
@@ -701,24 +699,35 @@
 
 (defun zrepl//ensure-newline () (unless (zerop (current-column)) (insert "\n")))
 
-(cl-defmacro zrepl//commiting-text (mark-form (&key props)  &rest body)
+(defun zrepl//recenter ()
+  (dolist (w (get-buffer-window-list))
+    (with-selected-window w
+      (recenter (min (count-screen-lines (window-start) (point) t)
+                     (- (window-height) 3))))))
+
+(cl-defun zrepl//call-committing-text (mark props fn)
+  (let ((start-point (point)))
+    (unwind-protect
+        (let ((start-pos (marker-position mark))
+              (inhibit-read-only t))
+          (set-marker zrepl//wmark (point))
+          (goto-char start-pos)
+          (funcall fn)
+          (set-marker mark (point))
+          (add-text-properties
+           start-pos (point)
+           (append `(read-only t front-sticky (read-only))
+                   props)))
+      (goto-char zrepl//wmark)
+      (unless (= (point) start-point)
+        (zrepl//recenter)))))
+
+(cl-defmacro zrepl//committing-text (mark-form (&key props)  &rest body)
   (declare (debug (sexp sexp &rest form)) (indent 2))
-  (let ((start-sym (gensym)))
-    `(unwind-protect
-         (let ((,start-sym (marker-position ,mark-form))
-               (inhibit-read-only t))
-           (set-marker zrepl//wmark (point))
-           (goto-char ,start-sym)
-           ,@body
-           (set-marker ,mark-form (point))
-           (add-text-properties
-            ,start-sym (point)
-            (append `(read-only t front-sticky (read-only))
-                    ,props)))
-       (goto-char zrepl//wmark))))
+  `(zrepl//call-committing-text ,mark-form ,props (lambda () ,@body)))
 
 (defun zrepl//insert-prompt (server)
-  (zrepl//commiting-text (zrepl//pmark)
+  (zrepl//committing-text (zrepl//pmark)
       (:props '(font-lock-face
                 comint-highlight-prompt
                 ;; brainlessly cargo-culted from SLY
@@ -749,21 +758,19 @@
       (goto-char (point-max))
       (add-text-properties (point-min) (point) '(font-lock-face font-lock-comment-face))
       (set-marker (process-mark (get-buffer-process (current-buffer))) (point)))
-    (zrepl//commiting-text (zrepl//pmark)
+    (zrepl//committing-text (zrepl//pmark)
         (:props '(font-lock-face comint-highlight-prompt))
       (insert "\n\n--- " (yow) " ---\n\n"))
     (zrepl//ocatch-up)
-    (zrepl//insert-prompt server)
-    (with-selected-window (or (get-buffer-window)
-                              (display-buffer (current-buffer)))
-      (goto-char (point-max))
-      (recenter 0))))
+    (unless (get-buffer-window)
+      (display-buffer (current-buffer)))
+    (zrepl//insert-prompt server)))
 
 (cl-defun zrepl//teardown (server &key (reason "disconnected"))
   (with-current-buffer (zapp--buffer :repl server)
     (remove-hook 'kill-buffer-hook 'zrepl//kbh t)
     (when-let ((p (zrepl//proc)))
-      (zrepl//commiting-text (zrepl//pmark)
+      (zrepl//committing-text (zrepl//pmark)
           (:props '(font-lock-face comint-highlight-prompt))
         (zrepl//ensure-newline)
         (insert (format "--- %s" (or reason "REPL teardown")))
@@ -781,7 +788,7 @@
 
 (cl-defun zrepl//output (string &key category)
     (cond ((zrepl//proc)
-         (zrepl//commiting-text zrepl//omark
+         (zrepl//committing-text zrepl//omark
                    (:props `(font-lock-face
                              ,(pcase category
                                 ("stdout" 'zrepl/output-face)
@@ -790,7 +797,7 @@
                  ;; no `comint-output-filter'
                  (insert string))
          (when (< (zrepl//pmark) zrepl//omark)
-           (zrepl//commiting-text (zrepl//pmark) ()
+           (zrepl//committing-text (zrepl//pmark) ()
              (goto-char zrepl//omark)
              (zrepl//ensure-newline))))
         (t
@@ -804,7 +811,10 @@
       (zrepl//output output :category category))))
 
 
-;;; pinhead
+;;;; Completion
+
+
+;;;; pinhead
 (add-hook 'zapp-connect-hook 'zapp--pinhead 99)
 (add-hook 'zapp-disconnect-hook 'zapp--pinhead-stop -99)
 
