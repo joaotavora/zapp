@@ -750,7 +750,7 @@
       (add-text-properties (point-min) (point) '(font-lock-face font-lock-comment-face))
       (set-marker (process-mark (get-buffer-process (current-buffer))) (point)))
     (zrepl//commiting-text (zrepl//pmark)
-        (:props '(font-lock-face warning))
+        (:props '(font-lock-face comint-highlight-prompt))
       (insert "\n\n--- " (yow) " ---\n\n"))
     (zrepl//ocatch-up)
     (zrepl//insert-prompt server)
@@ -764,7 +764,7 @@
     (remove-hook 'kill-buffer-hook 'zrepl//kbh t)
     (when-let ((p (zrepl//proc)))
       (zrepl//commiting-text (zrepl//pmark)
-          (:props '(font-lock-face warning))
+          (:props '(font-lock-face comint-highlight-prompt))
         (zrepl//ensure-newline)
         (insert (format "--- %s" (or reason "REPL teardown")))
         (zrepl//ensure-newline))
@@ -779,10 +779,14 @@
     (t (:bold t :italic t)))
   "Zapp repl output face.")
 
-(defun zrepl//output (string)
+(cl-defun zrepl//output (string &key category)
     (cond ((zrepl//proc)
          (zrepl//commiting-text zrepl//omark
-                   (:props '(font-lock-face zrepl/output-face))
+                   (:props `(font-lock-face
+                             ,(pcase category
+                                ("stdout" 'zrepl/output-face)
+                                ("stderr" 'warning)
+                                ((or "console" "output") 'zrepl/output-face))))
                  ;; no `comint-output-filter'
                  (insert string))
          (when (< (zrepl//pmark) zrepl//omark)
@@ -794,9 +798,10 @@
 
 (cl-defmethod zapp-handle-notification ((s zapp-generic-server)
                                         (_m (eql output))
-                                        &key output &allow-other-keys)
-  (with-current-buffer (zapp--buffer :repl s)
-    (zrepl//output output)))
+                                        &key output category &allow-other-keys)
+  (unless (equal category "telemetry")
+    (with-current-buffer (zapp--buffer :repl s)
+      (zrepl//output output :category category))))
 
 
 ;;; pinhead
