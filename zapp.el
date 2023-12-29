@@ -663,7 +663,7 @@
            (lambda (_pat)
              (cl-destructuring-bind (&key targets &allow-other-keys)
                  (jsonrpc-request
-                  s "completions"
+                  s :completions
                   ;; only codelldb was tested, good enough for now
                   `(:text "dummy" :column 1)
                   :cancel-on-input t
@@ -711,15 +711,24 @@
     (let ((forward-sexp-function nil)) (forward-sexp n))))
 
 (defun zrepl//input-sender (_proc string)
-  (let ((buf (current-buffer)))
-    (zrepl//ocatch-up)
-    (zapp--1seclater ()
-      (z//when-live-buffer buf
-        (zrepl//output
-         (format "Yes, definitely thinking hard about '%s'" string))
-        (zapp--1seclater ()
-          (z//when-live-buffer buf
-            (zrepl//insert-prompt (z//current-server-or-lose))))))))
+  (let ((buf (current-buffer))
+        (s (z//current-server-or-lose)))
+    (cl-flet ((outcome (x)
+                (zapp--when-live-buffer buf
+                  (zrepl//output (concat x "\n")) ; FIXME is this really "output"?
+                  (zrepl//insert-prompt s))))
+      (zrepl//ocatch-up)
+      (jsonrpc-async-request
+       s
+       :evaluate
+       `(,@nil :expression ,string
+               :context "repl")
+       :success-fn (jsonrpc-lambda (&key result &allow-other-keys)
+                     (outcome (format "--- %s" result)))
+       :timeout-fn (lambda (&rest _)
+                     (outcome "--- timeout"))
+       :error-fn (lambda (&rest e)
+                   (outcome (format "--- error %s!" e)))))))
 
 (defvar company-backends)
 
