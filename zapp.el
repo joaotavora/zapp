@@ -270,11 +270,13 @@
   (interactive (list (zapp--current-server-or-lose)))
   (cl-loop with display-buffer-alist = (zapp--info-dba)
            for b in (slot-value server 'buffers)
+           for existing = (get-buffer-window-list b)
            for w = (display-buffer b)
            do
            (cl-pushnew b (window-parameter w 'zapp--siblings))
            (setf (window-parameter w 'zapp--info-tabbar) nil)
-           (set-window-dedicated-p w 'dedicated)))
+           (set-window-dedicated-p w 'dedicated)
+           (dolist (e (delq w existing)) (delete-window e))))
 
 (defun zapp-teardown-windows (server)
   (dolist (b (slot-value server 'buffers))
@@ -615,34 +617,47 @@
   (jsonrpc-request s :configurationDone nil))
 
 
-;;;; Zapp REPL
+;;;; Zapp REPL, mostly lifted from SLY
 (require 'comint)
 
 (add-hook 'zapp-pre-connect-hook 'zrepl//setup 50)
 (add-hook 'zapp-disconnect-hook 'zrepl//teardown -50)
 
-;; most of this stolen from SLY, maybe inadequate/overkill
-(defvar zrepl//output-mark nil)
-(defvar zrepl//read-mark nil)
-(defvar zrepl//pending-output nil)
-(defvar zrepl//last-prompt-overlay nil)
+(defvar zrepl//omark nil "Output mark.")
+(defvar zrepl//wmark nil "Waiting for prompt mark.")
 
-(defun zrepl//syntax-propertize (_beg _end)
-  ;; maybe make everything up to prompt comment syntax?
-  nil)
+(defun zrepl//proc ()
+  "Dummy comint process for comint.el goodies."
+  (get-buffer-process (current-buffer)))
+(defun zrepl//pmark ()
+  "Process process mark."
+  (process-mark (zrepl//proc)))
+(defun zrepl//spmark ()
+  "Safe process mark."
+  (if (zrepl//proc) (zrepl//pmark) (point-max)))
 
-(defun zrepl//forward-sexp (_n)
-  ;; maybe inhibit some things?
-  )
+(defun zrepl//ocatch-up ()
+  "Catch-up omark with pmark"
+  (set-marker zrepl//omark (zrepl//pmark)))
+
+(defun zrepl//syntax-propertize (beg end)
+  (remove-text-properties beg end '(syntax-table nil))
+  (let ((end (min end (zrepl//spmark)))
+        (beg beg))
+    (when (> end beg)
+      (unless (nth 8 (syntax-ppss beg))
+        (add-text-properties beg (1+ beg)
+                             `(syntax-table ,(string-to-syntax "!"))))
+      (add-text-properties (1- end) end
+                           `(syntax-table ,(string-to-syntax "!"))))))
+
+(defun zrepl//forward-sexp (n)
+  (when (or (cl-plusp n) (/= (point) (zrepl//spmark)))
+    (let ((forward-sexp-function nil)) (forward-sexp n))))
 
 (defun zrepl//input-sender (_proc string)
   (let ((buf (current-buffer)))
-    ;; contrary to SLY, which uses a separate marker for the output,
-    ;; `string' will always contain the prompt, so do a little dance
-    (setq string (with-temp-buffer
-                   (save-excursion (insert string))
-                   (goto-char (field-end))
-                   (buffer-substring (point) (point-max))))
+    (zrepl//ocatch-up)
     (zapp--1seclater ()
       (z//when-live-buffer buf
         (zrepl//output
@@ -663,49 +678,47 @@
    comint-prompt-read-only              t
    comint-process-echoes                nil
    comint-completion-addsuffix          ""
+   comint-scroll-show-maximum-output    nil
+   comint-scroll-to-bottom-on-input     nil
+   comint-scroll-to-bottom-on-output    nil
 
-   zrepl//read-mark                     nil
-   zrepl//pending-output                nil
-   zrepl//output-mark                   (point-marker)
-   zrepl//last-prompt-overlay           (make-overlay 0 0 nil nil)
+   zrepl//omark                         (point-marker)
+   zrepl//wmark                         (point-marker)
 
    mode-line-process                    nil
    parse-sexp-ignore-comments           t
    syntax-propertize-function           #'zrepl//syntax-propertize
    forward-sexp-function                #'zrepl//forward-sexp
-   comint-scroll-show-maximum-output    nil
-   comint-scroll-to-bottom-on-input     nil
-   comint-scroll-to-bottom-on-output    nil
    inhibit-field-text-motion            nil
 
    mode-line-format '(:eval (zapp--info-mlf))
 
    buffer-file-coding-system            'utf-8-unix)
-  (set-marker-insertion-type zapp--repl-output-mark nil))
-
-(defun zrepl//proc () (get-buffer-process (current-buffer)))
-
-(defun zrepl//mark () (process-mark (zrepl//proc)))
+  (set-marker-insertion-type zrepl//omark nil)
+  (set-marker-insertion-type zrepl//wmark t))
 
 (defun zrepl//prompt (server) (concat (slot-value server 'nickname) "> "))
 
 (defun zrepl//ensure-newline () (unless (zerop (current-column)) (insert "\n")))
 
-(cl-defmacro zrepl//commiting-text ((&key props advance to-point) &rest body)
-  (declare (debug (sexp &rest form)) (indent 1))
+(cl-defmacro zrepl//commiting-text (mark-form (&key props)  &rest body)
+  (declare (debug (sexp sexp &rest form)) (indent 2))
   (let ((start-sym (gensym)))
-    `(let ((,start-sym (marker-position (zrepl//mark)))
-           (inhibit-read-only t))
-       (goto-char ,start-sym)
-       ,@body
-       ,@(when advance `((set-marker (process-mark (zrepl//proc)) (point))))
-       (add-text-properties
-        ,start-sym ,(if to-point '(point) '(zrepl//mark))
-        (append `(read-only t front-sticky (read-only))
-                ,props)))))
+    `(unwind-protect
+         (let ((,start-sym (marker-position ,mark-form))
+               (inhibit-read-only t))
+           (set-marker zrepl//wmark (point))
+           (goto-char ,start-sym)
+           ,@body
+           (set-marker ,mark-form (point))
+           (add-text-properties
+            ,start-sym (point)
+            (append `(read-only t front-sticky (read-only))
+                    ,props)))
+       (goto-char zrepl//wmark))))
 
 (defun zrepl//insert-prompt (server)
-  (zrepl//commiting-text
+  (zrepl//commiting-text (zrepl//pmark)
       (:props '(font-lock-face
                 comint-highlight-prompt
                 ;; brainlessly cargo-culted from SLY
@@ -715,8 +728,8 @@
                                 inhibit-line-move-field-capture
                                 read-only
                                 font-lock-face
-                                insert-in-front-hooks))
-              :to-point t)
+                                insert-in-front-hooks)))
+    (trace-values "Prompt insertion at" (zrepl//pmark))
     (zrepl//ensure-newline)
     (insert (slot-value server 'nickname) "> ")))
 
@@ -729,27 +742,33 @@
                    (current-buffer)
                    nil)
     (set-process-query-on-exit-flag (zrepl//proc) nil)
+    (set-process-sentinel (zrepl//proc) #'ignore)
     (add-hook 'kill-buffer-hook #'zrepl//kbh nil t)
 
     (let ((inhibit-read-only t))
       (goto-char (point-max))
       (add-text-properties (point-min) (point) '(font-lock-face font-lock-comment-face))
       (set-marker (process-mark (get-buffer-process (current-buffer))) (point)))
-    (zrepl//commiting-text (:props '(font-lock-face warning) :advance t)
+    (zrepl//commiting-text (zrepl//pmark)
+        (:props '(font-lock-face warning))
       (insert "\n\n--- " (yow) " ---\n\n"))
+    (zrepl//ocatch-up)
     (zrepl//insert-prompt server)
-    (goto-char (point-max))
-    (when-let ((w (get-buffer-window (current-buffer))))
-      (with-selected-window w (recenter (1- (window-height)))))))
+    (with-selected-window (or (get-buffer-window)
+                              (display-buffer (current-buffer)))
+      (goto-char (point-max))
+      (recenter 0))))
 
 (cl-defun zrepl//teardown (server &key (reason "disconnected"))
   (with-current-buffer (zapp--buffer :repl server)
     (remove-hook 'kill-buffer-hook 'zrepl//kbh t)
     (when-let ((p (zrepl//proc)))
-      (zrepl//commiting-text (:props '(font-lock-face warning) :advance t)
+      (zrepl//commiting-text (zrepl//pmark)
+          (:props '(font-lock-face warning))
         (zrepl//ensure-newline)
         (insert (format "--- %s" (or reason "REPL teardown")))
         (zrepl//ensure-newline))
+      (zrepl//ocatch-up)
       (delete-process p))))
 
 (defun zrepl//kbh () (zrepl//teardown (zapp--current-server-or-lose)))
@@ -760,11 +779,18 @@
     (t (:bold t :italic t)))
   "Zapp repl output face.")
 
-(defun zrepl//output (output)
-  (if (zrepl//proc)
-      (zrepl//commiting-text (:props '(font-lock-face zrepl/output-face))
-        (comint-output-filter (zrepl//proc) output))
-    (zapp--warn "Ignoring some output for a non-ready REPL")))
+(defun zrepl//output (string)
+    (cond ((zrepl//proc)
+         (zrepl//commiting-text zrepl//omark
+                   (:props '(font-lock-face zrepl/output-face))
+                 ;; no `comint-output-filter'
+                 (insert string))
+         (when (< (zrepl//pmark) zrepl//omark)
+           (zrepl//commiting-text (zrepl//pmark) ()
+             (goto-char zrepl//omark)
+             (zrepl//ensure-newline))))
+        (t
+         (zapp--warn "Ignoring some output for a non-ready REPL"))))
 
 (cl-defmethod zapp-handle-notification ((s zapp-generic-server)
                                         (_m (eql output))
@@ -784,7 +810,7 @@
             yow-timer
             (zapp--1seclater (4)
               (dolist (b (cl-remove (zapp--buffer :repl s) buffers))
-                (with-current-buffer b
+                (zapp--when-live-buffer b
                   (save-excursion
                     (let ((inhibit-read-only t))
                       (erase-buffer)
