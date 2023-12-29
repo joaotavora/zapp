@@ -154,6 +154,33 @@
       (error "No current debugging session.")))
 
 
+;;;; Capabilities
+(defcustom zapp-ignored-server-capabilities nil "" :type '(repeat symbol))
+
+(defun zapp-server-capable (&rest feats)
+  "Determine if current server is capable of FEATS."
+  (unless (cl-some (lambda (feat)
+                     (memq feat zapp-ignored-server-capabilities))
+                   feats)
+    (cl-loop for caps = (slot-value (zapp--current-server-or-lose)
+                                    'capabilities)
+             then (cadr probe)
+             for (feat . more) on feats
+             for probe = (plist-member caps feat)
+             if (not probe) do (cl-return nil)
+             if (eq (cadr probe) :json-false) do (cl-return nil)
+             if (not (listp (cadr probe))) do (cl-return (if more nil (cadr probe)))
+             finally (cl-return (or (cadr probe) t)))))
+
+(defun zapp-server-capable-or-lose (&rest feats)
+  "Like `zapp-server-capable', but maybe error out."
+  (let ((retval (apply #'zapp-server-capable feats)))
+    (unless retval
+      (zapp--error "Unsupported or ignored DAP capability `%s'"
+                    (mapconcat #'symbol-name feats " ")))
+    retval))
+
+
 ;;; Stupid DAP base protocol
 (cl-defmethod jsonrpc-convert-to-endpoint ((conn zapp-generic-server)
                                            message subtype)
@@ -299,7 +326,7 @@
 
 
 (defvar zapp-pre-connect-hook '())
-(defvar zapp-connect-hook '(zapp-setup-windows))
+(defvar zapp-connect-hook '(zapp-setup-windows zapp--kickoff))
 (defvar zapp-disconnect-hook '(zapp-teardown-windows))
 
 (defun zapp--on-shutdown (server)
@@ -395,11 +422,21 @@
         (setf zapp--current-server s)
         (setf status "contacting")
         (run-hook-with-args 'zapp-pre-connect-hook s)
-        (setf capabilities (jsonrpc-request s :initialize `(:adapterID ,nickname)))
+        (setf capabilities
+              (jsonrpc-request s :initialize
+                               `(,@nil :columnsStartAt1 t ; tho they don't
+                                       :adapterID ,nickname
+                                       )))
+        (zapp--message "Connected to '%s'!" nickname)
+        (run-hook-with-args 'zapp-connect-hook s)))))
+
+(defun zapp--kickoff (s)
+  (with-slots (kickoff-method kickoff-args status) s
+    (condition-case-unless-debug nil
         (jsonrpc-request s kickoff-method kickoff-args)
-        (setf status "yay?")
-        (run-hook-with-args 'zapp-connect-hook s)
-        (zapp--message "Connected to '%s'!" nickname)))))
+      (error
+       (zapp--warn "Couldn't kickoff '%s' with '%s'" kickoff-method kickoff-args)))
+    (setf status "yay?")))
 
 
 ;;;; Command-parsing heroics
@@ -615,6 +652,26 @@
   (jsonrpc-request s :configurationDone nil))
 
 
+;;;; Completion
+(cl-defun zapp-completion-at-point (&aux (s (zapp--current-server)))
+  (unless (and s (zapp-server-capable :supportsCompletionsRequest))
+    (cl-return-from zapp-completion-at-point))
+  (let* ((pos (point))
+         (bounds (or (bounds-of-thing-at-point 'symbol) (cons pos pos))))
+    (list (car bounds) (cdr bounds)
+          (completion-table-with-cache
+           (lambda (_pat)
+             (cl-destructuring-bind (&key targets &allow-other-keys)
+                 (jsonrpc-request
+                  s "completions"
+                  ;; only codelldb was tested, good enough for now
+                  `(:text "dummy" :column 1)
+                  :cancel-on-input t
+                  :cancel-on-input-retval nil)
+               (mapcar (jsonrpc-lambda (&key label &allow-other-keys) label)
+                       targets)))))))
+
+
 ;;;; Zapp REPL, mostly lifted from SLY
 (require 'comint)
 
@@ -664,6 +721,8 @@
           (z//when-live-buffer buf
             (zrepl//insert-prompt (z//current-server-or-lose))))))))
 
+(defvar company-backends)
+
 (define-derived-mode zapp--repl-mode comint-mode "zrepl"
   (setq-local
    comint-use-prompt-regexp             nil
@@ -691,7 +750,9 @@
 
    mode-line-format '(:eval (zapp--info-mlf))
 
-   buffer-file-coding-system            'utf-8-unix)
+   buffer-file-coding-system            'utf-8-unix
+   company-backends                     '(company-capf))
+  (add-hook 'completion-at-point-functions #'zapp-completion-at-point nil t)
   (set-marker-insertion-type zrepl//omark nil)
   (set-marker-insertion-type zrepl//wmark t))
 
@@ -809,9 +870,6 @@
   (unless (equal category "telemetry")
     (with-current-buffer (zapp--buffer :repl s)
       (zrepl//output output :category category))))
-
-
-;;;; Completion
 
 
 ;;;; pinhead
